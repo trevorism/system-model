@@ -1,0 +1,635 @@
+"""Extractors for the Micronaut + Groovy backend archetype.
+
+Code is truth: every fact here is derived by reading source/config as text. At the
+annotation/config granularity these facts live at, regex/line parsing is sufficient and
+keeps the adapter easy to extend. Each extractor returns pre-rendered Node(s).
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from systemmodel.core.filters import iter_files, read_text
+from systemmodel.core.schema import Level, Node
+
+HTTP_ANNOTATION = re.compile(r"@(Get|Post|Put|Delete|Patch|Head|Options)\b(?:\((.*)\))?")
+CLASS_DECL = re.compile(r"\bclass\s+(\w+)")
+IFACE_DECL = re.compile(r"\binterface\s+(\w+)")
+IMPL_DECL = re.compile(r"\bclass\s+(\w+)\s+implements\s+(\w+)")
+METHOD_CALL = re.compile(r"(\w+)\s*\(")
+
+# Groovy keywords that a naive `Type name` field regex would otherwise mistake for fields.
+_FIELD_STOPWORDS = {
+    "return", "import", "package", "new", "assert", "throw", "if", "else",
+    "for", "while", "class", "interface", "enum", "extends", "implements",
+    "this", "super", "def",
+}
+
+
+def _rel(repo: Path, path: Path) -> str:
+    return path.relative_to(repo).as_posix()
+
+
+def _first_string(text: str) -> str | None:
+    m = re.search(r'"([^"]*)"', text)
+    return m.group(1) if m else None
+
+
+def _read(repo: Path, rel: str) -> str | None:
+    p = repo / rel
+    return read_text(p) if p.exists() else None
+
+
+def _yaml_direct_child(text: str, parent: str, child: str) -> str | None:
+    """Value of a *direct* child key under `parent:` in indentation-based YAML.
+
+    Indentation-aware so a nested key (e.g. `security.token.jwt.enabled`) is not
+    mistaken for the direct child (`security.enabled`).
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(rf"^(\s*){re.escape(parent)}:\s*$", line)
+        if not m:
+            continue
+        parent_indent = len(m.group(1))
+        child_indent: int | None = None
+        for follow in lines[i + 1:]:
+            if not follow.strip():
+                continue
+            indent = len(follow) - len(follow.lstrip())
+            if indent <= parent_indent:
+                break  # dedent → parent block ended
+            if child_indent is None:
+                child_indent = indent
+            if indent == child_indent:
+                cm = re.match(rf"^\s*{re.escape(child)}:\s*(\S+)", follow)
+                if cm:
+                    return cm.group(1)
+        return None
+    return None
+
+
+# --------------------------------------------------------------------------- controllers
+
+@dataclass
+class Endpoint:
+    http: str
+    route: str
+    handler: str
+    role: str | None = None
+    permissions: str | None = None
+    allow_internal: bool = False
+    secured: bool = False
+
+
+@dataclass
+class Controller:
+    name: str
+    prefix: str
+    file: str
+    endpoints: list[Endpoint] = field(default_factory=list)
+    injects: list[tuple[str, str]] = field(default_factory=list)
+    constructor_params: list[str] = field(default_factory=list)
+
+
+def _join_route(prefix: str, value: str) -> str:
+    combined = (prefix or "/").rstrip("/") + "/" + (value or "").lstrip("/")
+    combined = re.sub(r"/+", "/", combined)
+    if len(combined) > 1:
+        combined = combined.rstrip("/")
+    return combined or "/"
+
+
+def _parse_secure(argstr: str) -> tuple[str | None, str | None, bool]:
+    role = None
+    m = re.search(r"Roles\.(\w+)", argstr)
+    if m:
+        role = m.group(1).lower()
+    perms = None
+    m = re.search(r"permissions\s*=\s*([^,)]+)", argstr)
+    if m:
+        raw = m.group(1).strip().strip('"').strip("'")
+        perms = raw.replace("Permissions.", "")
+    allow = bool(re.search(r"allowInternal\s*=\s*true", argstr))
+    return role, perms, allow
+
+
+def _annotation_value(argstr: str | None) -> str:
+    if not argstr:
+        return ""
+    m = re.search(r'value\s*=\s*"([^"]*)"', argstr)
+    if m:
+        return m.group(1)
+    # Positional route only when the FIRST argument is a bare string literal
+    # (`@Get("/x")`); a keyword arg like `produces = "application/json"` has no route.
+    m = re.match(r'\s*"([^"]*)"', argstr)
+    return m.group(1) if m else ""
+
+
+def _parse_controller(repo: Path, path: Path) -> Controller | None:
+    text = read_text(path)
+    if "@Controller" not in text:
+        return None
+    class_m = CLASS_DECL.search(text)
+    name = class_m.group(1) if class_m else path.stem
+    prefix_m = re.search(r"@Controller\s*\(\s*(.*?)\)", text, re.DOTALL)
+    prefix = _first_string(prefix_m.group(1)) if prefix_m else "/"
+    prefix = prefix or "/"
+
+    ctrl = Controller(name=name, prefix=prefix, file=_rel(repo, path))
+
+    # constructor params (constructor injection): `Name(...) {`
+    for m in re.finditer(rf"\b{re.escape(name)}\s*\(([^)]*)\)\s*\{{", text):
+        params = [p.strip() for p in m.group(1).split(",") if p.strip()]
+        ctrl.constructor_params = [p.split()[0] for p in params if " " in p or p]
+        break
+
+    pending_http: tuple[str, str] | None = None
+    pending_secure: tuple[str | None, str | None, bool] | None = None
+    class_secure: tuple[str | None, str | None, bool] | None = None
+    seen_class = False
+    prev_inject = False
+
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if not seen_class and re.match(r"(?:\w+\s+)*class\s+\w+", s):
+            seen_class = True
+        if s.startswith("@Inject"):
+            prev_inject = True
+            continue
+        if s.startswith("@Secure"):
+            # @Secure before `class` is a class-level default inherited by every
+            # endpoint that lacks its own @Secure; after `class` it is method-level.
+            if seen_class:
+                pending_secure = _parse_secure(s)
+            else:
+                class_secure = _parse_secure(s)
+            continue
+        http_m = HTTP_ANNOTATION.match(s)
+        if http_m:
+            pending_http = (http_m.group(1).upper(), _annotation_value(http_m.group(2)))
+            continue
+        if s.startswith("@"):
+            continue
+        if prev_inject:
+            fm = re.match(r"([\w<>,.\[\] ]+?)\s+(\w+)\s*$", s)
+            if fm:
+                ctrl.injects.append((fm.group(1).strip(), fm.group(2)))
+            prev_inject = False
+            # fall through in case this line is also a method (unlikely)
+        if pending_http:
+            call = METHOD_CALL.search(s)
+            if call and not s.startswith("//"):
+                effective = pending_secure or class_secure
+                role, perms, allow = effective or (None, None, False)
+                ctrl.endpoints.append(
+                    Endpoint(
+                        http=pending_http[0],
+                        route=_join_route(prefix, pending_http[1]),
+                        handler=call.group(1),
+                        role=role,
+                        permissions=perms,
+                        allow_internal=allow,
+                        secured=effective is not None,
+                    )
+                )
+                pending_http = None
+                pending_secure = None
+    return ctrl
+
+
+def _all_controllers(repo: Path) -> list[Controller]:
+    controllers: list[Controller] = []
+    for path in iter_files(repo, "src/main"):
+        if path.suffix == ".groovy" and path.stem.endswith("Controller"):
+            ctrl = _parse_controller(repo, path)
+            if ctrl:
+                controllers.append(ctrl)
+    controllers.sort(key=lambda c: c.name)
+    return controllers
+
+
+# ------------------------------------------------------------------------------ services
+
+@dataclass
+class Service:
+    interface: str | None
+    impl: str | None
+    file: str
+    singleton: bool
+    collaborators: list[str] = field(default_factory=list)
+
+
+def _collaborators(text: str) -> list[str]:
+    found: list[str] = []
+    for fm in re.finditer(r"private\s+([\w<>]+)\s+\w+", text):
+        t = fm.group(1)
+        if any(t.endswith(sfx) or t.startswith(sfx) for sfx in ("Client", "Service", "Repository")):
+            found.append(t)
+    return sorted(set(found))
+
+
+def _is_service_file(path: Path) -> bool:
+    posix = path.as_posix()
+    return path.suffix == ".groovy" and (
+        "/service/" in posix or path.stem.endswith("Service") or path.stem.endswith("Client")
+    )
+
+
+def _parse_services(repo: Path) -> list[Service]:
+    """Pair each `Default<X> implements X` impl with its interface into one row."""
+    interfaces: dict[str, str] = {}
+    impls: list[Service] = []
+    paired: set[str] = set()
+    for path in iter_files(repo, "src/main"):
+        if not _is_service_file(path):
+            continue
+        text = read_text(path)
+        impl_m = IMPL_DECL.search(text)
+        iface_m = IFACE_DECL.search(text)
+        if impl_m:
+            impls.append(Service(
+                interface=impl_m.group(2), impl=impl_m.group(1), file=_rel(repo, path),
+                singleton="Singleton" in text, collaborators=_collaborators(text),
+            ))
+            paired.add(impl_m.group(2))
+        elif iface_m:
+            interfaces[iface_m.group(1)] = _rel(repo, path)
+    services = list(impls)
+    for name, filerel in interfaces.items():
+        if name not in paired:
+            services.append(Service(interface=name, impl=None, file=filerel,
+                                    singleton=False, collaborators=[]))
+    services.sort(key=lambda s: (s.interface or s.impl or ""))
+    return services
+
+
+# -------------------------------------------------------------------------------- domain
+
+@dataclass
+class DomainType:
+    name: str
+    kind: str  # class | enum
+    file: str
+    fields: list[str] = field(default_factory=list)
+    values: list[str] = field(default_factory=list)
+
+
+def _parse_domain(repo: Path) -> list[DomainType]:
+    types: list[DomainType] = []
+    for path in iter_files(repo, "src/main"):
+        if path.suffix != ".groovy" or "/model/" not in path.as_posix():
+            continue
+        text = read_text(path)
+        enum_m = re.search(r"\benum\s+(\w+)", text)
+        if enum_m:
+            values: list[str] = []
+            vm = re.search(r"\benum\s+\w+[^{]*\{(.*?)(?:\n\s*\w+\s*\(|\})", text, re.DOTALL)
+            if vm:
+                for tok in re.findall(r"\b([A-Z][A-Z0-9_]+)\b", vm.group(1)):
+                    if tok not in values:
+                        values.append(tok)
+            types.append(DomainType(enum_m.group(1), "enum", _rel(repo, path), values=values))
+            continue
+        class_m = CLASS_DECL.search(text)
+        if not class_m:
+            continue
+        fields: list[str] = []
+        for line in text.splitlines():
+            fm = re.match(
+                r"\s*(?:private\s+|public\s+|protected\s+|final\s+|static\s+)*"
+                r"([A-Za-z_][\w<>,.\[\]]*)\s+([a-z]\w*)\s*(?:=.*)?$",
+                line,
+            )
+            if not fm:
+                continue
+            ftype, fname = fm.group(1), fm.group(2)
+            if fname == "log" or ftype in _FIELD_STOPWORDS:
+                continue
+            fields.append(f"{fname}: {ftype}")
+        types.append(DomainType(class_m.group(1), "class", _rel(repo, path), fields=fields))
+    types.sort(key=lambda t: t.name)
+    return types
+
+
+# ------------------------------------------------------------------------------ L1 facts
+
+def _service_facts(repo: Path) -> dict:
+    settings = _read(repo, "settings.gradle") or ""
+    readme = _read(repo, "README.md") or ""
+    app_groovy = ""
+    for path in iter_files(repo, "src/main"):
+        if path.name == "Application.groovy":
+            app_groovy = read_text(path)
+            break
+    build = _read(repo, "build.gradle") or ""
+    app_yaml = _read(repo, "src/main/appengine/app.yaml") or ""
+    application_yml = _read(repo, "src/main/resources/application.yml") or ""
+    deploy_yml = _read(repo, ".github/workflows/deploy.yml") or ""
+
+    name_m = re.search(r"rootProject\.name\s*=\s*['\"]([^'\"]+)['\"]", settings)
+    app_name_m = re.search(r"application:\s*\n\s*name:\s*(\S+)", application_yml)
+    name = (name_m.group(1) if name_m else None) or (app_name_m.group(1) if app_name_m else repo.name)
+
+    host_m = re.search(r"Deployed to\s+(?:\[[^\]]*\]\()?(https?://[^\s)]+)", readme)
+    host = host_m.group(1) if host_m else None
+    category = None
+    app_label = None
+    if host:
+        h = host.split("://", 1)[-1].strip("/")
+        labels = h.split(".")
+        if h.endswith("trevorism.com") and len(labels) >= 3:
+            sub = labels[:-2]  # drop trevorism.com
+            app_label = sub[0]
+            category = sub[1] if len(sub) > 1 else None
+
+    ping = None
+    for ctrl in _all_controllers(repo):
+        for ep in ctrl.endpoints:
+            if ep.route.endswith("/ping"):
+                ping = f"{ep.http} {ep.route}"
+    # OpenAPI version + description
+    oapi_ver = None
+    oapi_desc = None
+    oapi_block = re.search(r"@OpenAPIDefinition\s*\((.*?)\)\s*(?:@|class)", app_groovy, re.DOTALL)
+    scope = oapi_block.group(1) if oapi_block else app_groovy
+    vm = re.search(r'version\s*=\s*"([^"]+)"', scope)
+    if vm:
+        oapi_ver = vm.group(1)
+    dm = re.search(r'description\s*=\s*"([^"]+)"', scope)
+    if dm:
+        oapi_desc = dm.group(1)
+
+    # App Engine version (build.gradle deploy block) + project id
+    ae_ver = None
+    ae_block = re.search(r"deploy\s*\{(.*?)\}", build, re.DOTALL)
+    if ae_block:
+        m = re.search(r'version\s*=\s*"([^"]+)"', ae_block.group(1))
+        if m:
+            ae_ver = m.group(1)
+    proj_m = re.search(r'projectId\s*=\s*"([^"]+)"', build)
+    gcp_project = proj_m.group(1) if proj_m else None
+
+    # deploy.yml version + jdk
+    # `(?<![\w-])` so `java-version:` / `app_version:` don't masquerade as the app version;
+    # `[0-9.\-]*` so a single-digit version (e.g. `2`) still matches.
+    dep_ver_m = re.search(r"(?<![\w-])version:\s*['\"]?([0-9][0-9.\-]*)['\"]?", deploy_yml)
+    deploy_ver = dep_ver_m.group(1) if dep_ver_m else None
+    jdk_m = re.search(r"JDK_VERSION:\s*(\d+)", deploy_yml)
+    jdk = jdk_m.group(1) if jdk_m else None
+
+    runtime_m = re.search(r"runtime:\s*(\S+)", app_yaml)
+    runtime = runtime_m.group(1) if runtime_m else None
+
+    purpose = None
+    for line in readme.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#") and not s.startswith("!") and not s.lower().startswith("deployed"):
+            purpose = s
+            break
+
+    # version drift: normalize dashes to dots
+    def norm(v):
+        return v.replace("-", ".") if v else v
+
+    versions = {
+        "@OpenAPIDefinition": oapi_ver,
+        "build.gradle appengine": ae_ver,
+        "deploy.yml": deploy_ver,
+    }
+    present = {k: v for k, v in versions.items() if v}
+    distinct = {norm(v) for v in present.values()}
+    drift = len(distinct) > 1
+
+    return {
+        "name": name,
+        "host": host,
+        "app_label": app_label,
+        "category": category,
+        "ping": ping,
+        "purpose": purpose or oapi_desc,
+        "oapi_desc": oapi_desc,
+        "gcp_project": gcp_project,
+        "runtime": runtime,
+        "jdk": jdk,
+        "versions": present,
+        "drift": drift,
+    }
+
+
+# --------------------------------------------------------------------------------- render
+
+def _md_service(f: dict) -> str:
+    lines = [f"# {f['name']} — service (L1)", ""]
+    if f["purpose"]:
+        lines += [f"{f['purpose']}", ""]
+    lines += ["## Identity", ""]
+    lines += [f"- **App name:** `{f['name']}`"]
+    if f["host"]:
+        lines.append(f"- **Deployed host:** {f['host']}")
+    if f["app_label"]:
+        if f["category"]:
+            lines.append(f"- **App / category:** `{f['app_label']}` / `{f['category']}`")
+        else:
+            lines.append(f"- **App:** `{f['app_label']}` _(bare host, no category)_")
+    if f["ping"]:
+        lines.append(f"- **Liveness:** `{f['ping']}` → `pong`")
+    if f["gcp_project"]:
+        lines.append(f"- **GCP project:** `{f['gcp_project']}`")
+    if f["runtime"]:
+        lines.append(f"- **Runtime:** `{f['runtime']}`" + (f" (JDK {f['jdk']})" if f["jdk"] else ""))
+    lines.append("")
+    lines += ["## Version", ""]
+    for src, ver in f["versions"].items():
+        lines.append(f"- `{ver}` — {src}")
+    if f["drift"]:
+        lines += [
+            "",
+            "> ⚠️ **Version drift:** the sources above disagree. Code is truth; reconcile the "
+            "lagging source(s) to the intended release.",
+        ]
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _md_controllers(controllers: list[Controller]) -> str:
+    lines = ["# Controllers (L2)", "", "HTTP surface derived from Micronaut annotations.", ""]
+    lines += ["## Route table", "", "| Method | Route | Handler | Secured | Role | Permissions |",
+              "|---|---|---|---|---|---|"]
+    unsecured: list[tuple[str, str]] = []
+    for ctrl in controllers:
+        for ep in ctrl.endpoints:
+            sec = "yes" if ep.secured else "**no**"
+            role = ep.role or ""
+            perms = ep.permissions or ""
+            if ep.allow_internal:
+                perms = (perms + " +internal").strip()
+            lines.append(f"| {ep.http} | `{ep.route}` | {ctrl.name}.{ep.handler} | {sec} | {role} | {perms} |")
+            if not ep.secured:
+                unsecured.append((f"{ep.http} {ep.route}", ctrl.name))
+    lines.append("")
+    if unsecured:
+        lines += ["## Unsecured endpoints", "",
+                  "Deliberately public (no `@Secure`) — verify each is intended:", ""]
+        for route, cname in unsecured:
+            lines.append(f"- `{route}` — {cname}")
+        lines.append("")
+    lines += ["## Dependency injection", ""]
+    for ctrl in controllers:
+        deps = [t for t, _ in ctrl.injects] + ctrl.constructor_params
+        deps = [d for d in deps if d]
+        dep_str = ", ".join(f"`{d}`" for d in deps) if deps else "_none_"
+        lines.append(f"- **{ctrl.name}** (`@Controller(\"{ctrl.prefix}\")`) → {dep_str}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _md_services(services: list[Service]) -> str:
+    lines = ["# Services (L2)", "",
+             "Service registry — the `interface + Default<Name>` pattern.", "",
+             "| Interface | Implementation | Singleton | Collaborators |", "|---|---|---|---|"]
+    for s in services:
+        iface = s.interface or "—"
+        impl = s.impl or "—"
+        singleton = "yes" if s.singleton else ""
+        collab = ", ".join(f"`{c}`" for c in s.collaborators) if s.collaborators else ""
+        lines.append(f"| {iface} | {impl} | {singleton} | {collab} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _md_domain(types: list[DomainType]) -> str:
+    lines = ["# Domain model (L2)", "", "Domain types (POGOs / enums).", ""]
+    for t in types:
+        lines.append(f"## {t.name} ({t.kind})")
+        if t.kind == "enum" and t.values:
+            lines.append("")
+            lines.append("Values: " + ", ".join(f"`{v}`" for v in t.values))
+        elif t.fields:
+            lines.append("")
+            for fld in t.fields:
+                lines.append(f"- `{fld}`")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------------------- adapter
+
+class MicronautGroovyAdapter:
+    name = "micronaut_groovy"
+
+    def detect(self, repo: Path) -> bool:
+        build = _read(repo, "build.gradle") or ""
+        return "micronaut" in build.lower() or (repo / "src" / "main" / "groovy").exists()
+
+    def extract_service(self, repo: Path) -> Node:
+        f = _service_facts(repo)
+        provenance = [
+            p for p in ["settings.gradle", "README.md", "build.gradle",
+                        "src/main/appengine/app.yaml", "src/main/resources/application.yml",
+                        ".github/workflows/deploy.yml"]
+            if (repo / p).exists()
+        ]
+        app = next((str((x).relative_to(repo).as_posix())
+                    for x in iter_files(repo, "src/main") if x.name == "Application.groovy"), None)
+        if app:
+            provenance.append(app)
+        return Node(
+            level=Level.L1, kind="service", id="service", path="service.md",
+            body=_md_service(f), derived_from=provenance,
+        )
+
+    def extract_modules(self, repo: Path) -> list[Node]:
+        controllers = _all_controllers(repo)
+        services = _parse_services(repo)
+        domain = _parse_domain(repo)
+        return [
+            Node(Level.L2, "module", "controllers", "modules/controllers.md",
+                 _md_controllers(controllers),
+                 derived_from=sorted({c.file for c in controllers})),
+            Node(Level.L2, "module", "services", "modules/services.md",
+                 _md_services(services),
+                 derived_from=sorted({_rel(repo, p) for p in iter_files(repo, "src/main")
+                                      if _is_service_file(p)})),
+            Node(Level.L2, "module", "domain", "modules/domain.md",
+                 _md_domain(domain),
+                 derived_from=sorted({t.file for t in domain})),
+        ]
+
+    def extract_conventions(self, repo: Path) -> Node:
+        build = _read(repo, "build.gradle") or ""
+        gradle_props = _read(repo, "gradle.properties") or ""
+        plugins = []
+        for m in re.finditer(r'id\s*\(?\s*["\']([\w.]+)["\'](?:\s*\)?\s*version\s+["\']([\w.]+)["\'])?', build):
+            plugins.append((m.group(1), m.group(2)))
+        test_runtime_m = re.search(r'testRuntime\(\s*["\'](\w+)["\']', build)
+        mn_ver_m = re.search(r"micronautVersion=(\S+)", gradle_props)
+        acceptance = "com.trevorism.gradle.acceptance" in build
+        shadow = "com.gradleup.shadow" in build or "shadow" in build
+
+        lines = ["# Conventions (L3)", "", "## Build", ""]
+        if mn_ver_m:
+            lines.append(f"- **Micronaut:** {mn_ver_m.group(1)}")
+        if plugins:
+            lines.append("- **Gradle plugins:** " + ", ".join(
+                f"`{p}`" + (f" {v}" if v else "") for p, v in plugins))
+        if shadow:
+            lines.append("- **Packaging:** shadow fat-jar (`<name>-all.jar`)")
+        lines += ["", "## Testing", ""]
+        lines.append(f"- **Unit test runtime:** {test_runtime_m.group(1) if test_runtime_m else 'unknown'} "
+                     "(JUnit5 + Groovy; duck-typed collaborators, no Spock/Mockito)")
+        if acceptance:
+            lines.append("- **Acceptance:** cucumber-groovy via `com.trevorism.gradle.acceptance`; "
+                         "glue under `src/acceptance/groovy/com/trevorism/gcloud/`")
+        lines += ["", "## Naming", "",
+                  "- Controllers: `<Name>Controller`",
+                  "- Services: interface `<Name>Service` + impl `Default<Name>Service`",
+                  "- Persistence: `FastDatastoreRepository<Model>` (no local repository layer)",
+                  ""]
+        provenance = [p for p in ["build.gradle", "gradle.properties"] if (repo / p).exists()]
+        return Node(Level.L3, "convention", "conventions", "conventions.md",
+                    "\n".join(lines), derived_from=provenance)
+
+    def extract_invariants(self, repo: Path) -> Node:
+        build = _read(repo, "build.gradle") or ""
+        app_yaml = _read(repo, "src/main/appengine/app.yaml") or ""
+        application_yml = _read(repo, "src/main/resources/application.yml") or ""
+
+        jacoco_m = re.search(r"minimum\s*=\s*([\d.]+)", build)
+        gate = bool(re.search(r"build\.dependsOn\s+jacocoTestCoverageVerification", build))
+        security_enabled = _yaml_direct_child(application_yml, "security", "enabled") == "true"
+        https_appengine = bool(re.search(r"secure:\s*always", app_yaml))
+        https_redirect = bool(re.search(r"http-to-https-redirect:\s*true", application_yml))
+        secrets = (repo / "src/main/resources/secrets.properties").exists()
+
+        unsecured: list[tuple[str, str]] = []
+        for ctrl in _all_controllers(repo):
+            for ep in ctrl.endpoints:
+                if not ep.secured:
+                    unsecured.append((f"{ep.http} {ep.route}", ctrl.name))
+
+        lines = ["# Invariants (L4)", "", "Enforced constraints derived from build & config.", ""]
+        lines += ["## Coverage gate", ""]
+        if jacoco_m:
+            lines.append(f"- **JaCoCo minimum:** {jacoco_m.group(1)}")
+        lines.append(f"- **Wired into build:** {'yes (`build.dependsOn jacocoTestCoverageVerification`)' if gate else 'no'}")
+        lines += ["", "## Security & transport", ""]
+        lines.append(f"- **Micronaut security enabled:** {'yes' if security_enabled else 'no'}")
+        lines.append(f"- **HTTPS (App Engine `secure: always`):** {'yes' if https_appengine else 'no'}")
+        lines.append(f"- **HTTP→HTTPS redirect:** {'yes' if https_redirect else 'no'}")
+        if unsecured:
+            lines += ["", "## Deliberately unsecured endpoints", ""]
+            for route, cname in unsecured:
+                lines.append(f"- `{route}` — {cname}")
+        lines += ["", "## Observations", ""]
+        lines.append(f"- `secrets.properties` committed under `src/main/resources`: "
+                     f"{'present' if secrets else 'absent'}"
+                     + (" — should not be committed (verify .gitignore)" if secrets else ""))
+        lines.append("")
+        provenance = [p for p in ["build.gradle", "src/main/appengine/app.yaml",
+                                  "src/main/resources/application.yml"] if (repo / p).exists()]
+        return Node(Level.L4, "invariant", "invariants", "invariants.md",
+                    "\n".join(lines), derived_from=provenance)
