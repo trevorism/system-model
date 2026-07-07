@@ -48,10 +48,10 @@ generator_version: 0.1.0
 
 # Platform invariants (L0)
 
-Constraints (nearly) every service's code satisfies. Outliers are drift.
+**REQUIRED** lines are authored intent — violations are drift. Other lines are the observed norm across services, not a requirement.
 
-- **Micronaut security enabled:** 35/38 repos  ⚠ outliers: changelog, network, timeline
-- **HTTPS enforced (App Engine secure:always):** 36/38 repos  ⚠ outliers: monitor, trade
-- **HTTP→HTTPS redirect:** 38/38 repos
-- **Coverage gate wired into build:** 37/38 repos  ⚠ outliers: platform
-- **Liveness /ping endpoint:** 38/38 repos
+- **Micronaut security enabled:** REQUIRED `yes` — 35/38 conform  ⚠ violations: changelog, network, timeline
+- **HTTPS enforced (App Engine secure:always):** REQUIRED `yes` — 36/38 conform  ⚠ violations: monitor, trade
+- **HTTP→HTTPS redirect:** REQUIRED `yes` — 38/38 conform
+- **Coverage gate wired into build:** REQUIRED `yes` — 37/38 conform  ⚠ violations: platform
+- **Liveness /ping endpoint:** REQUIRED `yes` — 38/38 conform

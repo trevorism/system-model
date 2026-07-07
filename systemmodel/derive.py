@@ -5,6 +5,7 @@
     uv run systemmodel --all               # every auto-detected repo in the container
     uv run systemmodel --all --check       # platform-wide staleness check (CI)
     uv run systemmodel --platform          # L0 platform model -> system-model/.systemmodel/
+    uv run systemmodel <repo> --apply      # spec -> code: emit a change brief from the edited model
 
 (equivalently: python -m systemmodel.derive ...)
 
@@ -21,7 +22,8 @@ from pathlib import Path
 
 from systemmodel.core import adapter as adapters
 from systemmodel.core.adapter import extract_all
-from systemmodel.core.config import aggregate_kinds
+from systemmodel.core.apply import build_brief
+from systemmodel.core.config import aggregate_kinds, authored_signals
 from systemmodel.core.locate import dev_dir, platform_root, resolve_repo
 from systemmodel.core.platform import aggregate, render_platform
 from systemmodel.core.render import MODEL_DIRNAME, render
@@ -86,6 +88,35 @@ def _candidate_repos() -> list[Path]:
     return sorted(p for p in base.iterdir() if p.is_dir() and not p.name.startswith("."))
 
 
+def _apply_repo(repo: Path, args) -> int:
+    """Spec -> change brief: diff the edited on-disk model against derived code, emit instructions."""
+    root = repo / MODEL_DIRNAME
+    if not root.exists():
+        print(f"error: no model at {root}\n"
+              f"       run `uv run systemmodel {repo.name}` first, then edit the .md files and "
+              f"re-run --apply.", file=sys.stderr)
+        return 2
+    try:
+        adapter = adapters.select(repo, args.adapter)
+        nodes = extract_all(adapter, repo)  # current state, in memory — never overwrites the spec
+    except LookupError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"error: failed to derive {repo.name}: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+
+    brief = build_brief(repo, nodes)
+    if brief is None:
+        print(f"{repo.name}: code already matches the spec — nothing to apply.")
+        return 0
+    out = repo / "change-brief.md"
+    out.write_text(brief, encoding="utf-8", newline="\n")
+    print(brief)
+    print(f"\n(wrote {out})")
+    return 0
+
+
 def _derive_platform(args, generated_at: str) -> int:
     """Aggregate platform signals across all repos into the L0 model in system-model/.systemmodel."""
     agg_kinds = aggregate_kinds()
@@ -125,7 +156,7 @@ def _derive_platform(args, generated_at: str) -> int:
     # Provenance/counts reflect the repos actually aggregated (a service whose signals
     # raised is in the census but not in records).
     repos_used = sorted(r for r, _ in records)
-    aggs = aggregate(records, specs)
+    aggs = aggregate(records, specs, authored_signals())
     nodes = render_platform(aggs, census, agg_kinds, repos_used, adapters_used)
     root = platform_root()
     result = render(root, nodes, adapter="+".join(sorted(adapters_used)),
@@ -150,6 +181,13 @@ def _derive_platform(args, generated_at: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # The model (and briefs) use Unicode (→, ⚠, ×); don't crash on a legacy console (Windows cp1252).
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(
         prog="systemmodel", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -161,6 +199,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="print the plan without writing")
     parser.add_argument("--check", action="store_true",
                         help="report drift vs the checked-in model without writing; exit 1 if stale")
+    parser.add_argument("--apply", action="store_true",
+                        help="spec -> code: diff the edited on-disk model against the code and emit "
+                             "a change brief (does not edit code)")
     args = parser.parse_args(argv)
 
     if not args.all and not args.repo and not args.platform:
@@ -169,6 +210,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--platform stands alone (not with a repo or --all)")
     if args.all and args.repo:
         parser.error("use either a repo name or --all, not both")
+    if args.apply and (args.all or args.platform):
+        parser.error("--apply works on a single repo (not with --all/--platform)")
+    if args.apply and args.check:
+        parser.error("--apply (spec->code) and --check (code->model) are opposite directions; use one")
+    if args.apply and not args.repo:
+        parser.error("--apply requires a repo name")
 
     generated_at = datetime.now().isoformat(timespec="seconds")
 
@@ -210,6 +257,10 @@ def main(argv: list[str] | None = None) -> int:
     if not repo.exists():
         print(f"error: repo path does not exist: {repo}", file=sys.stderr)
         return 2
+
+    if args.apply:
+        return _apply_repo(repo, args)
+
     try:
         status, detail, adapter_name = _process_repo(repo, args, generated_at)
     except LookupError as e:

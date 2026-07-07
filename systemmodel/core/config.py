@@ -46,3 +46,37 @@ def aggregate_kinds() -> list[str]:
     if isinstance(kinds, list) and all(isinstance(k, str) for k in kinds) and kinds:
         return list(kinds)
     return list(DEFAULT_AGGREGATE_KINDS)
+
+
+def _flatten(table: dict, prefix: str = "") -> dict[str, object]:
+    """Flatten nested tables into dotted keys.
+
+    TOML parses a dotted key (`security.enabled = true`) into nested tables
+    (`{security: {enabled: true}}`); signal keys are dotted strings, so re-join them.
+    """
+    out: dict[str, object] = {}
+    for k, v in table.items():
+        key = f"{prefix}{k}"
+        if isinstance(v, dict):
+            out.update(_flatten(v, key + "."))
+        else:
+            out[key] = v
+    return out
+
+
+def authored_signals() -> dict[str, object]:
+    """Prescriptive required/expected value per platform signal key.
+
+    Merges the `[invariants]` (bool) and `[conventions]` (value) tables of platform.toml
+    into one {signal_key: required_value} map. A signal present here is *required* — the
+    platform model measures conformance against it and reports violators (the derived ≠
+    authored gap). Absent keys stay descriptive. Non-table sections are ignored so a typo
+    can't crash aggregation.
+    """
+    cfg = _load()
+    authored: dict[str, object] = {}
+    for section in ("invariants", "conventions"):
+        table = cfg.get(section, {})
+        if isinstance(table, dict):
+            authored.update(_flatten(table))
+    return authored

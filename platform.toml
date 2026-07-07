@@ -13,3 +13,24 @@
 # Which kinds the platform model aggregates invariants/conventions over.
 # Default is services only; widen if you want library/tester conventions too.
 aggregate_kinds = ["service"]
+
+# ---------------------------------------------------------------------------------------
+# AUTHORED INTENT (prescriptive). A signal listed here is REQUIRED: the platform model
+# measures every service against it and reports violators (the derived != authored gap).
+# Omit a signal to leave it descriptive (the model just reports the observed norm).
+# Values must match the derived type: booleans for [invariants], quoted strings for
+# [conventions] (e.g. jdk = "25", not 25).
+# ---------------------------------------------------------------------------------------
+
+[invariants]        # bool signals every service MUST satisfy
+security.enabled    = true
+https.secure_always = true
+https.redirect      = true
+coverage.gate       = true
+ping.present        = true
+
+[conventions]       # value signals with a required/expected value
+jdk               = "25"
+micronaut.version = "5.0.2"
+test.runtime      = "junit5"
+# coverage.minimum intentionally omitted -> stays descriptive (thresholds vary by service)

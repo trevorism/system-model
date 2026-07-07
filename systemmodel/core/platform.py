@@ -23,20 +23,38 @@ class SignalSpec:
     type: str  # "bool" | "value"
 
 
+# Sentinel distinguishing "no authored requirement" from an authored value that happens to
+# be None. A signal with authored != _UNSET is prescriptive (required); otherwise descriptive.
+_UNSET = object()
+
+
 @dataclass
 class Aggregate:
     spec: SignalSpec
     pairs: list[tuple[str, object]]  # (repo, value) for every reporting repo
     counts: dict[object, int] = field(default_factory=dict)
-    expected: object = None
+    expected: object = None          # descriptive norm (mode of real values)
+    authored: object = _UNSET        # prescriptive required value, or _UNSET if not authored
 
     @property
     def total(self) -> int:
         return len(self.pairs)
 
+    @property
+    def is_required(self) -> bool:
+        return self.authored is not _UNSET
 
-def aggregate(records: list[tuple[str, dict]], specs: dict[str, SignalSpec]) -> dict[str, Aggregate]:
-    """Group per-repo signal values by key; expected value = the most common one."""
+    def violators(self) -> list[tuple[str, object]]:
+        """(repo, value) pairs that violate the authored requirement; [] if not required."""
+        if not self.is_required:
+            return []
+        return [(r, v) for r, v in self.pairs if v != self.authored]
+
+
+def aggregate(records: list[tuple[str, dict]], specs: dict[str, SignalSpec],
+              authored: dict[str, object] | None = None) -> dict[str, Aggregate]:
+    """Group per-repo signal values by key; expected = most common; attach authored intent."""
+    authored = authored or {}
     by_key: dict[str, list[tuple[str, object]]] = {}
     for repo, signals in records:
         for key, value in signals.items():
@@ -55,7 +73,8 @@ def aggregate(records: list[tuple[str, dict]], specs: dict[str, SignalSpec]) -> 
         real = {v: c for v, c in counts.items() if v is not None}
         expected = (max(real.items(), key=lambda kv: (kv[1], str(kv[0])))[0]
                     if real else None)
-        aggs[key] = Aggregate(spec=spec, pairs=sorted(pairs), counts=counts, expected=expected)
+        aggs[key] = Aggregate(spec=spec, pairs=sorted(pairs), counts=counts, expected=expected,
+                              authored=authored.get(key, _UNSET))
     return aggs
 
 
@@ -68,23 +87,40 @@ def _disp(value: object) -> str:
 
 
 def _invariant_line(agg: Aggregate) -> str:
-    """Bool invariant: how many repos hold it (value True), and who doesn't."""
+    """Bool invariant. Prescriptive (authored) -> conform/violations; else descriptive."""
+    if agg.is_required:
+        violators = [r for r, _ in agg.violators()]
+        conform = agg.total - len(violators)
+        line = f"- **{agg.spec.label}:** REQUIRED `{_disp(agg.authored)}` — {conform}/{agg.total} conform"
+        if violators:
+            line += "  ⚠ violations: " + ", ".join(violators)
+        return line
     non_holders = [r for r, v in agg.pairs if not v]
     held = agg.total - len(non_holders)
-    line = f"- **{agg.spec.label}:** {held}/{agg.total} repos"
+    line = f"- **{agg.spec.label}:** {held}/{agg.total} repos (observed, not required)"
     if non_holders:
         line += "  ⚠ outliers: " + ", ".join(non_holders)
     return line
 
 
 def _convention_line(agg: Aggregate) -> str:
-    """Value convention: the expected value + a breakdown; deviating and unset repos named."""
+    """Value convention. Prescriptive (authored) -> conform/violations; else descriptive."""
     breakdown = ", ".join(
         f"`{_disp(v)}`×{c}"
         for v, c in sorted(agg.counts.items(), key=lambda kv: (-kv[1], str(kv[0])))
     )
-    line = f"- **{agg.spec.label}:** expected `{_disp(agg.expected)}` ({breakdown})"
-    # A repo that sets a different real value has drifted; one that sets nothing is "unset".
+    if agg.is_required:
+        deviating = [(r, v) for r, v in agg.pairs if v is not None and v != agg.authored]
+        unset = [r for r, v in agg.pairs if v is None]
+        conform = agg.total - len(deviating) - len(unset)
+        line = (f"- **{agg.spec.label}:** REQUIRED `{_disp(agg.authored)}` — "
+                f"{conform}/{agg.total} conform ({breakdown})")
+        if deviating:
+            line += "  ⚠ " + ", ".join(f"{r}=`{_disp(v)}`" for r, v in deviating)
+        if unset:
+            line += "  · unset: " + ", ".join(unset)
+        return line
+    line = f"- **{agg.spec.label}:** expected `{_disp(agg.expected)}` (observed norm) ({breakdown})"
     deviating = [(r, v) for r, v in agg.pairs if v is not None and v != agg.expected]
     unset = [r for r, v in agg.pairs if v is None]
     if deviating:
@@ -134,22 +170,43 @@ def render_platform(
     for kind in sorted(census):
         repos = sorted(census[kind])
         index.append(f"- **{kind}** ({len(repos)}): {', '.join(repos)}")
+
+    # Conformance = the derived ≠ authored gap. Only prescriptive (authored) signals count.
+    required = [a for a in ordered if a.is_required]
+    violating_signals = [a for a in required if a.violators()]
+    repos_in_violation = sorted({r for a in required for r, _ in a.violators()})
+    index += ["", "## Conformance (authored intent)", ""]
+    if not required:
+        index.append("No authored requirements yet — the model is descriptive only. "
+                     "Add `[invariants]`/`[conventions]` to `platform.toml` to require values.")
+    elif not violating_signals:
+        index.append(f"✅ All {len(required)} authored requirements hold across "
+                     f"{len(aggregated_repos)} repos.")
+    else:
+        index.append(f"- **Authored requirements:** {len(required)}")
+        index.append(f"- **Signals with violations:** {len(violating_signals)}")
+        index.append(f"- **Repos in violation:** {', '.join(repos_in_violation)}")
+        index.append("")
+        index.append("Each violation is a `derived ≠ authored` gap — fix the code, or change the "
+                     "spec in `platform.toml`. See invariants.md / conventions.md for specifics.")
     index += [
         "",
-        "An invariant's `N/total` is how many aggregated repos satisfy it; ⚠ names the ones "
-        "that don't (drift from the platform norm).",
+        "In invariants/conventions below, **REQUIRED** = authored intent (violations are drift); "
+        "otherwise the line is the observed norm, not a requirement.",
         "",
     ]
     provenance = aggregated_repos
 
     inv_body = ["# Platform invariants (L0)", "",
-                "Constraints (nearly) every service's code satisfies. Outliers are drift.", ""]
+                "**REQUIRED** lines are authored intent — violations are drift. Other lines are the "
+                "observed norm across services, not a requirement.", ""]
     for a in invariants:
         inv_body.append(_invariant_line(a))
     inv_body.append("")
 
     conv_body = ["# Platform conventions (L0)", "",
-                 "Shared build/test/runtime choices; the expected value is the platform norm.", ""]
+                 "**REQUIRED** lines are authored intent — violations are drift. Other lines report "
+                 "the observed norm.", ""]
     for a in conventions:
         conv_body.append(_convention_line(a))
     conv_body.append("")

@@ -14,9 +14,10 @@ builds and runs it (the first run creates `.venv`; after that it's instant).
 
 ```
 # one repo
-uv run systemmodel <repo>              # derive <repo>/.systemmodel/
+uv run systemmodel <repo>              # derive <repo>/.systemmodel/  (code -> model)
 uv run systemmodel <repo> --dry-run    # preview, write nothing
 uv run systemmodel <repo> --check      # is the model stale vs the code? exit 1 if so
+uv run systemmodel <repo> --apply      # spec -> code: emit a change brief from the edited model
 
 # whole platform
 uv run systemmodel --all               # derive every auto-detected repo in the container
@@ -66,6 +67,50 @@ aggregates invariants over **services only** and publishes a **repo census**, so
 experiments no longer show up as false outliers. `platform.toml` (optional, in the repo root)
 overrides a repo's kind when intent differs from structure, or widens which kinds get aggregated.
 
+### Authored intent (descriptive vs prescriptive)
+
+By default the platform model is **descriptive** — it reports the *observed norm* (what most services
+do) and names statistical outliers. Author intent in `platform.toml` to make a signal
+**prescriptive** — a *requirement* that services are measured against, where any non-matching repo is
+a **violation** (the `derived ≠ authored` gap): fix the code, or change the spec.
+
+```toml
+[invariants]          # bool signals every service MUST satisfy
+security.enabled    = true
+https.secure_always = true
+coverage.gate       = true
+
+[conventions]         # value signals with a required value (quote values: "25", not 25)
+jdk               = "25"
+micronaut.version = "5.0.2"
+```
+
+The L0 `platform.md` then leads with a **Conformance** summary (requirements, signals with
+violations, repos in violation); `invariants.md` / `conventions.md` mark each authored signal
+**REQUIRED** with a conform count and violators, while un-authored signals stay labeled as the
+observed norm. (This is platform-level authoring; per-repo authored specs are a later slice.)
+
+## Two directions: derive vs apply
+
+The model reconciles code and intent, and **you pick which side wins by the command you run**:
+
+- **`derive` — code is truth.** Re-reads the code and (re)writes `.systemmodel/`. Use it after the
+  code changes.
+- **`--apply` — spec is truth.** You edit the `.systemmodel/*.md` to describe *desired* state; this
+  re-derives the current code **in memory** (never overwriting your edits), diffs it against your
+  edited spec, and emits a **change brief** (`<repo>/change-brief.md` + stdout): per changed
+  document, the `current → desired` diff and the **source files to edit** (from each node's
+  `derived_from`), with the acceptance criterion `uv run systemmodel <repo> --check` is clean.
+
+system-model does **not** edit code — the brief is handed to an agent (Claude Code) or the developer,
+who makes the change; re-derivation is the acceptance test that the change conformed. (Auto-invoking
+the agent is a planned `--auto` follow-on.)
+
+Note: the `.md` files double as the spec format for now, so a hand-edit must be internally consistent
+— e.g. securing an endpoint means updating both the route table *and* the "unsecured endpoints"
+section it feeds. A more formal spec format (tighter targets, machine-checkable acceptance) is on the
+roadmap.
+
 ## How it stays honest
 
 The model lives in the target repo and is only truth if it's regenerated when the code changes.
@@ -109,8 +154,10 @@ envelope.
 
 ## Roadmap (later phases)
 
-2. **Authoring + drift** — an authored-spec surface and `derived ≠ authored` gap routing.
-3. **Conformance gate** — invariants as machine checks, wired into the test-result pipeline.
+2. **Authoring + drift** — *platform-level done* (authored `[invariants]`/`[conventions]`); *spec→code
+   done* (`--apply` emits a change brief). Next: `--auto` (invoke the agent from the brief) and a
+   formal per-repo spec format.
+3. **Conformance gate** — turn authored violations / apply-briefs into a failing exit code, wired into the test-result pipeline.
 4. **Graph/dashboard projection** over the model.
 
 ## Known limitations

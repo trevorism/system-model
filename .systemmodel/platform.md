@@ -76,4 +76,12 @@ Each repo's kind (service invariants apply only to services). Kinds are derived 
 - **template** (2): template-vue3, template-webapi
 - **tester** (4): endpoint-tester, event-tester, expiration-tester, prompt-tester
 
-An invariant's `N/total` is how many aggregated repos satisfy it; ⚠ names the ones that don't (drift from the platform norm).
+## Conformance (authored intent)
+
+- **Authored requirements:** 8
+- **Signals with violations:** 5
+- **Repos in violation:** action, active, alert, bigquery, catalog, changelog, chat, cleo-frontend, deploy, email, event, flare-api-portal, list, monitor, network, platform, project, schedule, tenant, threshold, timeline, trade
+
+Each violation is a `derived ≠ authored` gap — fix the code, or change the spec in `platform.toml`. See invariants.md / conventions.md for specifics.
+
+In invariants/conventions below, **REQUIRED** = authored intent (violations are drift); otherwise the line is the observed norm, not a requirement.
