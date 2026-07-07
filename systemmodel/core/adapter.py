@@ -41,6 +41,18 @@ class Adapter(Protocol):
         """L4: enforced invariants (coverage gate, security, transport, ...)."""
         ...
 
+    def platform_signal_specs(self) -> list:
+        """SignalSpecs for this adapter's platform-scoped signals (empty if unsupported)."""
+        ...
+
+    def platform_signals(self, repo: Path) -> dict:
+        """This repo's value for each platform signal key (empty if unsupported)."""
+        ...
+
+    def classify(self, repo: Path) -> str:
+        """Classify the repo (service | library | tester | template | experiment)."""
+        ...
+
 
 _REGISTRY: dict[str, Adapter] = {}
 

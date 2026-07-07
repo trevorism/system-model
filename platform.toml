@@ -1,0 +1,15 @@
+# Platform policy for system-model (optional; delete to fall back to pure derivation).
+#
+# Repo kinds are DERIVED from code by default (service / library / tester / template /
+# experiment). Use this file only for what code can't tell us — intent — or to correct a
+# misclassification.
+
+[repos]
+# Override a repo's derived kind. Example:
+#   draw = "experiment"     # structurally looks like a service, but it's a spike
+# (draw and predict already derive to "experiment"; add entries here only for exceptions.)
+
+[policy]
+# Which kinds the platform model aggregates invariants/conventions over.
+# Default is services only; widen if you want library/tester conventions too.
+aggregate_kinds = ["service"]

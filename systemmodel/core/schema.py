@@ -19,8 +19,9 @@ GENERATOR_VERSION = "0.1.0"
 
 
 class Level(str, Enum):
-    """Altitude in the one hierarchy. Repos are the L1 node; L0 (cross-repo) is future."""
+    """Altitude in the one hierarchy. L0 is platform-wide; L1 is a single service/repo."""
 
+    L0 = "L0"  # platform (cross-repo)
     L1 = "L1"  # service / repo
     L2 = "L2"  # module
     L3 = "L3"  # convention

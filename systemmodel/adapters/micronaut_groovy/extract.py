@@ -10,8 +10,24 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from systemmodel.core.config import aggregate_kinds, repo_kind_override
 from systemmodel.core.filters import iter_files, read_text
+from systemmodel.core.platform import SignalSpec
 from systemmodel.core.schema import Level, Node
+
+# Platform-scoped signals: facts that are properties of the platform, not any one repo.
+# Aggregated across repos into the L0 model; each repo reports its own value.
+PLATFORM_SIGNAL_SPECS = [
+    SignalSpec("security.enabled", "Micronaut security enabled", "invariant", "bool"),
+    SignalSpec("https.secure_always", "HTTPS enforced (App Engine secure:always)", "invariant", "bool"),
+    SignalSpec("https.redirect", "HTTP→HTTPS redirect", "invariant", "bool"),
+    SignalSpec("coverage.gate", "Coverage gate wired into build", "invariant", "bool"),
+    SignalSpec("ping.present", "Liveness /ping endpoint", "invariant", "bool"),
+    SignalSpec("jdk", "JDK version", "convention", "value"),
+    SignalSpec("micronaut.version", "Micronaut version", "convention", "value"),
+    SignalSpec("test.runtime", "Unit test runtime", "convention", "value"),
+    SignalSpec("coverage.minimum", "Coverage minimum", "convention", "value"),
+]
 
 HTTP_ANNOTATION = re.compile(r"@(Get|Post|Put|Delete|Patch|Head|Options)\b(?:\((.*)\))?")
 CLASS_DECL = re.compile(r"\bclass\s+(\w+)")
@@ -66,8 +82,15 @@ def _yaml_direct_child(text: str, parent: str, child: str) -> str | None:
                 cm = re.match(rf"^\s*{re.escape(child)}:\s*(\S+)", follow)
                 if cm:
                     return cm.group(1)
-        return None
+        # child not in this block — keep scanning; another `parent:` block may have it
     return None
+
+
+def _yaml_bool(value: str | None) -> bool:
+    """Interpret a raw YAML scalar as a boolean (true/yes, any case, quotes tolerated)."""
+    if value is None:
+        return False
+    return value.strip().strip('"\'').lower() in ("true", "yes")
 
 
 # --------------------------------------------------------------------------- controllers
@@ -428,6 +451,8 @@ def _md_service(f: dict) -> str:
         lines += [f"{f['purpose']}", ""]
     lines += ["## Identity", ""]
     lines += [f"- **App name:** `{f['name']}`"]
+    if f.get("kind"):
+        lines.append(f"- **Kind:** `{f['kind']}`")
     if f["host"]:
         lines.append(f"- **Deployed host:** {f['host']}")
     if f["app_label"]:
@@ -516,6 +541,66 @@ def _md_domain(types: list[DomainType]) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------- platform signals
+
+def _platform_signals(repo: Path) -> dict:
+    """This repo's value for each platform-scoped signal key (see PLATFORM_SIGNAL_SPECS)."""
+    build = _read(repo, "build.gradle") or ""
+    app_yaml = _read(repo, "src/main/appengine/app.yaml") or ""
+    application_yml = _read(repo, "src/main/resources/application.yml") or ""
+    gradle_props = _read(repo, "gradle.properties") or ""
+    deploy_yml = _read(repo, ".github/workflows/deploy.yml") or ""
+
+    jacoco_m = re.search(r"minimum\s*=\s*([\d.]+)", build)
+    mn_m = re.search(r"micronautVersion\s*=\s*(\S+)", gradle_props)
+    test_m = re.search(r'testRuntime\(\s*["\'](\w+)["\']', build)
+    jdk_m = re.search(r"JDK_VERSION:\s*(\d+)", deploy_yml) or re.search(r"runtime:\s*java(\d+)", app_yaml)
+    ping = any(ep.route.endswith("/ping") for c in _all_controllers(repo) for ep in c.endpoints)
+
+    return {
+        "security.enabled": _yaml_bool(_yaml_direct_child(application_yml, "security", "enabled")),
+        "https.secure_always": bool(re.search(r"secure:\s*always", app_yaml)),
+        "https.redirect": bool(re.search(r"http-to-https-redirect:\s*true", application_yml)),
+        "coverage.gate": bool(re.search(r"build\.dependsOn\s+jacocoTestCoverageVerification", build)),
+        "ping.present": ping,
+        "jdk": jdk_m.group(1) if jdk_m else None,
+        "micronaut.version": mn_m.group(1) if mn_m else None,
+        "test.runtime": test_m.group(1) if test_m else None,
+        "coverage.minimum": jacoco_m.group(1) if jacoco_m else None,
+    }
+
+
+def _fmt_signal(spec: SignalSpec, value) -> str:
+    if value is None:
+        return "—"
+    if spec.type == "bool":
+        return "yes" if value else "no"
+    return f"`{value}`"
+
+
+def _classify(repo: Path) -> str:
+    """Derive a repo's kind from structural signals (config overrides take precedence upstream)."""
+    name = repo.name
+    if name.startswith("template-"):
+        return "template"
+    if name.endswith("-tester"):
+        return "tester"
+    build = _read(repo, "build.gradle") or ""
+    if "java-gradle-plugin" in build or "gradlePlugin" in build or "io.micronaut.library" in build:
+        return "library"
+    has_appengine = (repo / "src/main/appengine/app.yaml").exists()
+    if not has_appengine and ("maven-publish" in build or "publishing" in build or "java-library" in build):
+        return "library"
+    if has_appengine or "io.micronaut.application" in build:
+        return "service"
+    return "experiment"  # has source but none of a service/library/tester/template marker
+
+
+def classify(repo: Path) -> str:
+    """A repo's kind: an authored override if present, else derived from code."""
+    return repo_kind_override(repo.name) or _classify(repo)
+
+
 # ------------------------------------------------------------------------------- adapter
 
 class MicronautGroovyAdapter:
@@ -525,8 +610,12 @@ class MicronautGroovyAdapter:
         build = _read(repo, "build.gradle") or ""
         return "micronaut" in build.lower() or (repo / "src" / "main" / "groovy").exists()
 
+    def classify(self, repo: Path) -> str:
+        return classify(repo)
+
     def extract_service(self, repo: Path) -> Node:
         f = _service_facts(repo)
+        f["kind"] = classify(repo)
         provenance = [
             p for p in ["settings.gradle", "README.md", "build.gradle",
                         "src/main/appengine/app.yaml", "src/main/resources/application.yml",
@@ -566,7 +655,7 @@ class MicronautGroovyAdapter:
         for m in re.finditer(r'id\s*\(?\s*["\']([\w.]+)["\'](?:\s*\)?\s*version\s+["\']([\w.]+)["\'])?', build):
             plugins.append((m.group(1), m.group(2)))
         test_runtime_m = re.search(r'testRuntime\(\s*["\'](\w+)["\']', build)
-        mn_ver_m = re.search(r"micronautVersion=(\S+)", gradle_props)
+        mn_ver_m = re.search(r"micronautVersion\s*=\s*(\S+)", gradle_props)
         acceptance = "com.trevorism.gradle.acceptance" in build
         shadow = "com.gradleup.shadow" in build or "shadow" in build
 
@@ -593,43 +682,48 @@ class MicronautGroovyAdapter:
         return Node(Level.L3, "convention", "conventions", "conventions.md",
                     "\n".join(lines), derived_from=provenance)
 
+    def platform_signal_specs(self) -> list:
+        return PLATFORM_SIGNAL_SPECS
+
+    def platform_signals(self, repo: Path) -> dict:
+        return _platform_signals(repo)
+
     def extract_invariants(self, repo: Path) -> Node:
-        build = _read(repo, "build.gradle") or ""
-        app_yaml = _read(repo, "src/main/appengine/app.yaml") or ""
-        application_yml = _read(repo, "src/main/resources/application.yml") or ""
-
-        jacoco_m = re.search(r"minimum\s*=\s*([\d.]+)", build)
-        gate = bool(re.search(r"build\.dependsOn\s+jacocoTestCoverageVerification", build))
-        security_enabled = _yaml_direct_child(application_yml, "security", "enabled") == "true"
-        https_appengine = bool(re.search(r"secure:\s*always", app_yaml))
-        https_redirect = bool(re.search(r"http-to-https-redirect:\s*true", application_yml))
+        # Platform-governed facts are shown as *this repo's values*, pointing at the L0
+        # platform model for the norm + outliers; only genuinely per-repo facts are L4.
+        sig = _platform_signals(repo)
         secrets = (repo / "src/main/resources/secrets.properties").exists()
-
         unsecured: list[tuple[str, str]] = []
         for ctrl in _all_controllers(repo):
             for ep in ctrl.endpoints:
                 if not ep.secured:
                     unsecured.append((f"{ep.http} {ep.route}", ctrl.name))
 
-        lines = ["# Invariants (L4)", "", "Enforced constraints derived from build & config.", ""]
-        lines += ["## Coverage gate", ""]
-        if jacoco_m:
-            lines.append(f"- **JaCoCo minimum:** {jacoco_m.group(1)}")
-        lines.append(f"- **Wired into build:** {'yes (`build.dependsOn jacocoTestCoverageVerification`)' if gate else 'no'}")
-        lines += ["", "## Security & transport", ""]
-        lines.append(f"- **Micronaut security enabled:** {'yes' if security_enabled else 'no'}")
-        lines.append(f"- **HTTPS (App Engine `secure: always`):** {'yes' if https_appengine else 'no'}")
-        lines.append(f"- **HTTP→HTTPS redirect:** {'yes' if https_redirect else 'no'}")
+        kind = classify(repo)
+        lines = ["# Invariants (L4)", "",
+                 "## Platform-governed", ""]
+        if kind in aggregate_kinds():
+            lines += ["Governed by the platform model (`system-model/.systemmodel/`); the norm and "
+                      "outliers live there. This repo's values:", ""]
+            for spec in PLATFORM_SIGNAL_SPECS:
+                lines.append(f"- **{spec.label}:** {_fmt_signal(spec, sig.get(spec.key))}")
+        else:
+            lines.append(f"Not applicable — this repo is classified `{kind}`, and platform "
+                         "invariants apply to services.")
+
+        lines += ["", "## Repo-specific", ""]
         if unsecured:
-            lines += ["", "## Deliberately unsecured endpoints", ""]
+            lines.append("Deliberately unsecured endpoints (verify each is intended):")
+            lines.append("")
             for route, cname in unsecured:
                 lines.append(f"- `{route}` — {cname}")
-        lines += ["", "## Observations", ""]
+            lines.append("")
         lines.append(f"- `secrets.properties` committed under `src/main/resources`: "
                      f"{'present' if secrets else 'absent'}"
                      + (" — should not be committed (verify .gitignore)" if secrets else ""))
         lines.append("")
         provenance = [p for p in ["build.gradle", "src/main/appengine/app.yaml",
-                                  "src/main/resources/application.yml"] if (repo / p).exists()]
+                                  "src/main/resources/application.yml", "gradle.properties",
+                                  ".github/workflows/deploy.yml"] if (repo / p).exists()]
         return Node(Level.L4, "invariant", "invariants", "invariants.md",
                     "\n".join(lines), derived_from=provenance)

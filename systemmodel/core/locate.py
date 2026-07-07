@@ -16,13 +16,18 @@ _SKIPPED_DIR_NAMES = {
 }
 
 
+def platform_root() -> Path:
+    """The system-model repo root (holds platform.toml and the L0 .systemmodel/)."""
+    # locate.py -> core -> systemmodel -> <this repo>
+    return Path(__file__).resolve().parents[2]
+
+
 def dev_dir() -> Path:
     """Container directory holding sibling repos (this repo's parent by default)."""
     env = os.environ.get("DEV_DIR")
     if env:
         return Path(env)
-    # locate.py -> core -> systemmodel -> <this repo> -> <container>
-    return Path(__file__).resolve().parents[3]
+    return platform_root().parent
 
 
 def _iter_search_dirs(root: Path, max_depth: int = _MAX_SEARCH_DEPTH):
