@@ -28,9 +28,11 @@ https.secure_always = true
 https.redirect      = true
 coverage.gate       = true
 ping.present        = true
+micronaut.version_aligned = true   # BOM (gradle.properties) must match the application-plugin version
 
 [conventions]       # value signals with a required/expected value
-jdk               = "25"
-micronaut.version = "5.0.2"
-test.runtime      = "junit5"
+jdk                      = "25"
+micronaut.version        = "5.0.2"
+micronaut.plugin.version = "5.0.2"   # the io.micronaut.application plugin, tracked alongside the BOM
+test.runtime             = "junit5"
 # coverage.minimum intentionally omitted -> stays descriptive (thresholds vary by service)

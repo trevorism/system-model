@@ -23,8 +23,10 @@ PLATFORM_SIGNAL_SPECS = [
     SignalSpec("https.redirect", "HTTP→HTTPS redirect", "invariant", "bool"),
     SignalSpec("coverage.gate", "Coverage gate wired into build", "invariant", "bool"),
     SignalSpec("ping.present", "Liveness /ping endpoint", "invariant", "bool"),
+    SignalSpec("micronaut.version_aligned", "Micronaut BOM/plugin versions aligned", "invariant", "bool"),
     SignalSpec("jdk", "JDK version", "convention", "value"),
-    SignalSpec("micronaut.version", "Micronaut version", "convention", "value"),
+    SignalSpec("micronaut.version", "Micronaut version (BOM)", "convention", "value"),
+    SignalSpec("micronaut.plugin.version", "Micronaut version (application plugin)", "convention", "value"),
     SignalSpec("test.runtime", "Unit test runtime", "convention", "value"),
     SignalSpec("coverage.minimum", "Coverage minimum", "convention", "value"),
 ]
@@ -55,6 +57,18 @@ def _first_string(text: str) -> str | None:
 def _read(repo: Path, rel: str) -> str | None:
     p = repo / rel
     return read_text(p) if p.exists() else None
+
+
+# The Micronaut version is declared in two independent places that can drift apart: the
+# dependency BOM (`micronautVersion` in gradle.properties) and the Gradle application plugin
+# (`id("io.micronaut.application") version "X"` in build.gradle). Reading only the BOM
+# under-reports repos whose plugin lags (e.g. bom=5.0.2 but plugin=5.0.0).
+_MN_PLUGIN_RE = re.compile(r'io\.micronaut\.application["\')\s]*version\s*["\']([^"\']+)["\']')
+
+
+def _micronaut_plugin_version(build: str) -> str | None:
+    m = _MN_PLUGIN_RE.search(build)
+    return m.group(1) if m else None
 
 
 def _yaml_direct_child(text: str, parent: str, child: str) -> str | None:
@@ -557,14 +571,22 @@ def _platform_signals(repo: Path) -> dict:
     jdk_m = re.search(r"JDK_VERSION:\s*(\d+)", deploy_yml) or re.search(r"runtime:\s*java(\d+)", app_yaml)
     ping = any(ep.route.endswith("/ping") for c in _all_controllers(repo) for ep in c.endpoints)
 
+    mn_bom = mn_m.group(1) if mn_m else None
+    mn_plugin = _micronaut_plugin_version(build)
+    # Aligned only when both are known; None (unknown) when either is absent so we don't
+    # invent a mismatch for a repo that declares neither.
+    aligned = (mn_bom == mn_plugin) if (mn_bom and mn_plugin) else None
+
     return {
         "security.enabled": _yaml_bool(_yaml_direct_child(application_yml, "security", "enabled")),
         "https.secure_always": bool(re.search(r"secure:\s*always", app_yaml)),
         "https.redirect": bool(re.search(r"http-to-https-redirect:\s*true", application_yml)),
         "coverage.gate": bool(re.search(r"build\.dependsOn\s+jacocoTestCoverageVerification", build)),
         "ping.present": ping,
+        "micronaut.version_aligned": aligned,
         "jdk": jdk_m.group(1) if jdk_m else None,
-        "micronaut.version": mn_m.group(1) if mn_m else None,
+        "micronaut.version": mn_bom,
+        "micronaut.plugin.version": mn_plugin,
         "test.runtime": test_m.group(1) if test_m else None,
         "coverage.minimum": jacoco_m.group(1) if jacoco_m else None,
     }
@@ -659,9 +681,15 @@ class MicronautGroovyAdapter:
         acceptance = "com.trevorism.gradle.acceptance" in build
         shadow = "com.gradleup.shadow" in build or "shadow" in build
 
+        mn_plugin_ver = _micronaut_plugin_version(build)
         lines = ["# Conventions (L3)", "", "## Build", ""]
         if mn_ver_m:
-            lines.append(f"- **Micronaut:** {mn_ver_m.group(1)}")
+            lines.append(f"- **Micronaut (BOM):** {mn_ver_m.group(1)}")
+        if mn_plugin_ver:
+            line = f"- **Micronaut (application plugin):** {mn_plugin_ver}"
+            if mn_ver_m and mn_ver_m.group(1) != mn_plugin_ver:
+                line += f"  ⚠ drift: does not match BOM `{mn_ver_m.group(1)}`"
+            lines.append(line)
         if plugins:
             lines.append("- **Gradle plugins:** " + ", ".join(
                 f"`{p}`" + (f" {v}" if v else "") for p, v in plugins))

@@ -50,8 +50,9 @@ generator_version: 0.1.0
 
 **REQUIRED** lines are authored intent — violations are drift. Other lines are the observed norm across services, not a requirement.
 
-- **Micronaut security enabled:** REQUIRED `yes` — 35/38 conform  ⚠ violations: changelog, network, timeline
-- **HTTPS enforced (App Engine secure:always):** REQUIRED `yes` — 36/38 conform  ⚠ violations: monitor, trade
+- **Micronaut security enabled:** REQUIRED `yes` — 36/38 conform  ⚠ violations: network, timeline
+- **HTTPS enforced (App Engine secure:always):** REQUIRED `yes` — 38/38 conform
 - **HTTP→HTTPS redirect:** REQUIRED `yes` — 38/38 conform
 - **Coverage gate wired into build:** REQUIRED `yes` — 37/38 conform  ⚠ violations: platform
 - **Liveness /ping endpoint:** REQUIRED `yes` — 38/38 conform
+- **Micronaut BOM/plugin versions aligned:** REQUIRED `yes` — 26/38 conform  ⚠ violations: bucket, candlebot, catalog, cleo-frontend, datastore, encryption, github, memory, network, platform, stripe, timeline

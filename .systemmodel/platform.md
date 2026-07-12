@@ -72,16 +72,6 @@ Each repo's kind (service invariants apply only to services). Kinds are derived 
 
 - **experiment** (2): draw, predict, platform, cleo-frontend
 - **library** (4): gradle-acceptance-plugin, kraken, micronaut-security-utils, micronaut-utility-beans
-- **service** (38): action, active, alert, auth-provider, bigquery, billing, bucket, candlebot, catalog, changelog, chat, data, datastore, deploy, email, encryption, event, flare-api-portal, github, health-dash, homepage, list, login, memo, memory, monitor, network,  project, prompt, schedule, stripe, tenant, testing, threshold, timeline, trade
+- **service** (38): action, active, alert, auth-provider, bigquery, billing, bucket, candlebot, catalog, changelog, chat, data, datastore, deploy, email, encryption, event, flare-api-portal, github, health-dash, homepage, list, login, memo, memory, monitor, network, project, prompt, schedule, stripe, tenant, testing, threshold, timeline, trade
 - **template** (2): template-vue3, template-webapi
 - **tester** (4): endpoint-tester, event-tester, expiration-tester, prompt-tester
-
-## Conformance (authored intent)
-
-- **Authored requirements:** 8
-- **Signals with violations:** 5
-- **Repos in violation:** action, active, alert, bigquery, catalog, changelog, chat, cleo-frontend, deploy, email, event, flare-api-portal, list, monitor, network, platform, project, schedule, tenant, threshold, timeline, trade
-
-Each violation is a `derived ≠ authored` gap — fix the code, or change the spec in `platform.toml`. See invariants.md / conventions.md for specifics.
-
-In invariants/conventions below, **REQUIRED** = authored intent (violations are drift); otherwise the line is the observed norm, not a requirement.
