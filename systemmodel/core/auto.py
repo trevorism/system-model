@@ -101,8 +101,9 @@ def run_auto(repo: Path, adapter: Adapter, *, max_iters: int = 3, dangerous: boo
         prompt = brief + _AGENT_FOOTER.format(repo=repo.name)
         try:
             # Inherit stdout/stderr so the user watches the agent; prompt goes on stdin to
-            # dodge argv length limits on large briefs.
-            proc = subprocess.run(cmd, cwd=repo, input=prompt, text=True)
+            # dodge argv length limits on large briefs. Force utf-8 for stdin — the brief carries
+            # → / ⚠ from the diffs and Windows' default cp1252 can't encode them.
+            proc = subprocess.run(cmd, cwd=repo, input=prompt, text=True, encoding="utf-8")
         except FileNotFoundError:
             on_log("error: `claude` CLI not found on PATH.")
             return 2
