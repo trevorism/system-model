@@ -29,8 +29,14 @@ _AGENT_FOOTER = (
 
 
 def _claude_cmd(dangerous: bool, model: str | None) -> list[str]:
-    """The `claude` invocation (prompt is fed on stdin, so it's not in argv)."""
-    cmd = ["claude", "-p"]
+    """The `claude` invocation (prompt is fed on stdin, so it's not in argv).
+
+    `--verbose --output-format stream-json` makes headless (`-p`) mode emit each step as it
+    happens (one JSON object per line) instead of buffering silently until the turn ends — so the
+    user can watch the agent work. The output is raw JSON lines; pretty-printing is left to the
+    caller's terminal.
+    """
+    cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json"]
     cmd += (["--dangerously-skip-permissions"] if dangerous
             else ["--permission-mode", "acceptEdits"])
     if model:
