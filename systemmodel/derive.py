@@ -6,6 +6,7 @@
     uv run systemmodel --all --check       # platform-wide staleness check (CI)
     uv run systemmodel --platform          # L0 platform model -> system-model/.systemmodel/
     uv run systemmodel <repo> --apply      # spec -> code: emit a change brief from the edited model
+    uv run systemmodel <repo> --auto       # spec -> code: drive an agent from the brief, then verify
 
 (equivalently: python -m systemmodel.derive ...)
 
@@ -23,6 +24,7 @@ from pathlib import Path
 from systemmodel.core import adapter as adapters
 from systemmodel.core.adapter import extract_all
 from systemmodel.core.apply import build_brief
+from systemmodel.core.auto import run_auto
 from systemmodel.core.config import aggregate_kinds, authored_signals
 from systemmodel.core.locate import dev_dir, platform_root, resolve_repo
 from systemmodel.core.platform import aggregate, render_platform
@@ -202,6 +204,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true",
                         help="spec -> code: diff the edited on-disk model against the code and emit "
                              "a change brief (does not edit code)")
+    parser.add_argument("--auto", action="store_true",
+                        help="spec -> code: drive the claude CLI from the change brief to edit the "
+                             "repo, then re-derive to verify (loops until --check clean)")
+    parser.add_argument("--max-iters", type=int, default=3,
+                        help="--auto: max agent iterations before giving up (default 3)")
+    parser.add_argument("--dangerous", action="store_true",
+                        help="--auto: run the agent with --dangerously-skip-permissions instead of "
+                             "acceptEdits (lets it run Bash/tests, but can run anything)")
+    parser.add_argument("--model", help="--auto: model for the spawned claude agent")
     args = parser.parse_args(argv)
 
     if not args.all and not args.repo and not args.platform:
@@ -216,6 +227,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--apply (spec->code) and --check (code->model) are opposite directions; use one")
     if args.apply and not args.repo:
         parser.error("--apply requires a repo name")
+    if args.auto and (args.all or args.platform):
+        parser.error("--auto works on a single repo (not with --all/--platform)")
+    if args.auto and args.check:
+        parser.error("--auto (spec->code) and --check (code->model) are opposite directions; use one")
+    if args.auto and args.apply:
+        parser.error("--auto drives an agent from the brief; --apply only emits it — use one")
+    if args.auto and not args.repo:
+        parser.error("--auto requires a repo name")
 
     generated_at = datetime.now().isoformat(timespec="seconds")
 
@@ -260,6 +279,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.apply:
         return _apply_repo(repo, args)
+
+    if args.auto:
+        try:
+            adapter = adapters.select(repo, args.adapter)
+        except LookupError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        return run_auto(repo, adapter, max_iters=args.max_iters, dangerous=args.dangerous,
+                        model=args.model, dry_run=args.dry_run)
 
     try:
         status, detail, adapter_name = _process_repo(repo, args, generated_at)

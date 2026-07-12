@@ -70,9 +70,9 @@ System-wide invariants and conventions, derived by aggregating the code of every
 
 Each repo's kind (service invariants apply only to services). Kinds are derived from code; `platform.toml` can override.
 
-- **experiment** (2): draw, predict
+- **experiment** (2): draw, predict, platform, cleo-frontend
 - **library** (4): gradle-acceptance-plugin, kraken, micronaut-security-utils, micronaut-utility-beans
-- **service** (38): action, active, alert, auth-provider, bigquery, billing, bucket, candlebot, catalog, changelog, chat, cleo-frontend, data, datastore, deploy, email, encryption, event, flare-api-portal, github, health-dash, homepage, list, login, memo, memory, monitor, network, platform, project, prompt, schedule, stripe, tenant, testing, threshold, timeline, trade
+- **service** (38): action, active, alert, auth-provider, bigquery, billing, bucket, candlebot, catalog, changelog, chat, data, datastore, deploy, email, encryption, event, flare-api-portal, github, health-dash, homepage, list, login, memo, memory, monitor, network,  project, prompt, schedule, stripe, tenant, testing, threshold, timeline, trade
 - **template** (2): template-vue3, template-webapi
 - **tester** (4): endpoint-tester, event-tester, expiration-tester, prompt-tester
 

@@ -18,6 +18,7 @@ uv run systemmodel <repo>              # derive <repo>/.systemmodel/  (code -> m
 uv run systemmodel <repo> --dry-run    # preview, write nothing
 uv run systemmodel <repo> --check      # is the model stale vs the code? exit 1 if so
 uv run systemmodel <repo> --apply      # spec -> code: emit a change brief from the edited model
+uv run systemmodel <repo> --auto       # spec -> code: drive an agent from the brief, then verify
 
 # whole platform
 uv run systemmodel --all               # derive every auto-detected repo in the container
@@ -103,8 +104,15 @@ The model reconciles code and intent, and **you pick which side wins by the comm
   `derived_from`), with the acceptance criterion `uv run systemmodel <repo> --check` is clean.
 
 system-model does **not** edit code — the brief is handed to an agent (Claude Code) or the developer,
-who makes the change; re-derivation is the acceptance test that the change conformed. (Auto-invoking
-the agent is a planned `--auto` follow-on.)
+who makes the change; re-derivation is the acceptance test that the change conformed.
+
+`--auto` closes this loop: it feeds the brief to the `claude` CLI (non-interactively) so the agent
+edits the repo, then re-derives and rebuilds the brief as the acceptance gate, looping on any
+residual drift up to `--max-iters` (default 3). system-model still never edits code — it only
+orchestrates the agent and verifies. Guardrails: it refuses on a dirty git working tree (so the
+agent's edits stay isolated and revertable) and never commits; the agent runs with `acceptEdits`
+by default, or `--dangerous` (`--dangerously-skip-permissions`) if it needs Bash/tests. Preview
+with `--dry-run` (prints the brief + the command, mutates nothing).
 
 Note: the `.md` files double as the spec format for now, so a hand-edit must be internally consistent
 — e.g. securing an endpoint means updating both the route table *and* the "unsecured endpoints"
@@ -155,8 +163,8 @@ envelope.
 ## Roadmap (later phases)
 
 2. **Authoring + drift** — *platform-level done* (authored `[invariants]`/`[conventions]`); *spec→code
-   done* (`--apply` emits a change brief). Next: `--auto` (invoke the agent from the brief) and a
-   formal per-repo spec format.
+   done* (`--apply` emits a change brief, `--auto` drives an agent from it and re-derives to verify).
+   Next: a formal per-repo spec format.
 3. **Conformance gate** — turn authored violations / apply-briefs into a failing exit code, wired into the test-result pipeline.
 4. **Graph/dashboard projection** over the model.
 
@@ -166,4 +174,5 @@ envelope.
   unconventional layouts may be partially captured.
 - Only the `micronaut_groovy` adapter exists, so repos without Micronaut/Groovy markers (e.g. some
   pure-Java shared libraries) aren't detected/classified at all — they'd need their own adapter.
-- Read path only — no authoring, drift, or conformance yet.
+- No conformance gate yet — authored violations / apply-briefs don't produce a CI-failing exit
+  code wired into the test-result pipeline (roadmap item 3).
