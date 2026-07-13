@@ -51,6 +51,23 @@ class Aggregate:
         return [(r, v) for r, v in self.pairs if v != self.authored]
 
 
+@dataclass(frozen=True)
+class Conformance:
+    """The `derived ≠ authored` gap across all platform signals (authored ones only)."""
+
+    required: list[Aggregate]           # all authored (is_required) signals
+    violating_signals: list[Aggregate]  # the subset with at least one violator
+    repos_in_violation: list[str]       # sorted union of repos violating any requirement
+
+
+def conformance(aggs: dict[str, Aggregate]) -> Conformance:
+    """Compute the authored-intent conformance summary. Only prescriptive signals count."""
+    required = [a for a in aggs.values() if a.is_required]
+    violating = [a for a in required if a.violators()]
+    repos = sorted({r for a in required for r, _ in a.violators()})
+    return Conformance(required=required, violating_signals=violating, repos_in_violation=repos)
+
+
 def aggregate(records: list[tuple[str, dict]], specs: dict[str, SignalSpec],
               authored: dict[str, object] | None = None) -> dict[str, Aggregate]:
     """Group per-repo signal values by key; expected = most common; attach authored intent."""
@@ -78,12 +95,16 @@ def aggregate(records: list[tuple[str, dict]], specs: dict[str, SignalSpec],
     return aggs
 
 
-def _disp(value: object) -> str:
+def display_value(value: object) -> str:
+    """Human display for a signal value: None -> —, bools -> yes/no, else str."""
     if value is None:
         return "—"
     if isinstance(value, bool):
         return "yes" if value else "no"
     return str(value)
+
+
+_disp = display_value  # internal shorthand used throughout this module
 
 
 def _invariant_line(agg: Aggregate) -> str:
@@ -172,20 +193,18 @@ def render_platform(
         index.append(f"- **{kind}** ({len(repos)}): {', '.join(repos)}")
 
     # Conformance = the derived ≠ authored gap. Only prescriptive (authored) signals count.
-    required = [a for a in ordered if a.is_required]
-    violating_signals = [a for a in required if a.violators()]
-    repos_in_violation = sorted({r for a in required for r, _ in a.violators()})
+    conf = conformance(aggs)
     index += ["", "## Conformance (authored intent)", ""]
-    if not required:
+    if not conf.required:
         index.append("No authored requirements yet — the model is descriptive only. "
                      "Add `[invariants]`/`[conventions]` to `platform.toml` to require values.")
-    elif not violating_signals:
-        index.append(f"✅ All {len(required)} authored requirements hold across "
+    elif not conf.violating_signals:
+        index.append(f"✅ All {len(conf.required)} authored requirements hold across "
                      f"{len(aggregated_repos)} repos.")
     else:
-        index.append(f"- **Authored requirements:** {len(required)}")
-        index.append(f"- **Signals with violations:** {len(violating_signals)}")
-        index.append(f"- **Repos in violation:** {', '.join(repos_in_violation)}")
+        index.append(f"- **Authored requirements:** {len(conf.required)}")
+        index.append(f"- **Signals with violations:** {len(conf.violating_signals)}")
+        index.append(f"- **Repos in violation:** {', '.join(conf.repos_in_violation)}")
         index.append("")
         index.append("Each violation is a `derived ≠ authored` gap — fix the code, or change the "
                      "spec in `platform.toml`. See invariants.md / conventions.md for specifics.")

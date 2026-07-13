@@ -7,6 +7,9 @@
     uv run systemmodel --platform          # L0 platform model -> $SYSTEMMODEL_DIR/ (root)
     uv run systemmodel <repo> --apply      # spec -> code: emit a change brief from the edited model
     uv run systemmodel <repo> --auto       # spec -> code: drive an agent from the brief, then verify
+    uv run systemmodel <repo> --gate       # conformance: exit 1 if code violates authored intent
+    uv run systemmodel --all --gate        # conformance across all repos (CI gate)
+    uv run systemmodel --platform --gate   # conformance: exit 1 if platform.toml requirements violated
 
 (equivalently: python -m systemmodel.derive ...)
 
@@ -22,11 +25,11 @@ from pathlib import Path
 
 from systemmodel.core import adapter as adapters
 from systemmodel.core.adapter import extract_all
-from systemmodel.core.apply import build_brief
+from systemmodel.core.apply import build_brief, spec_gaps
 from systemmodel.core.auto import run_auto
 from systemmodel.core.config import aggregate_kinds, authored_signals
 from systemmodel.core.locate import dev_dir, model_root, platform_model_root, resolve_repo
-from systemmodel.core.platform import aggregate, render_platform
+from systemmodel.core.platform import aggregate, conformance, display_value as _disp, render_platform
 from systemmodel.core.render import read_manifest, render
 
 
@@ -77,6 +80,16 @@ def _candidate_repos() -> list[Path]:
     if not base.exists():
         return []
     return sorted(p for p in base.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+
+def _gate_repo(repo: Path, args) -> list[str]:
+    """Per-repo conformance: the model doc paths whose code diverges from the edited spec.
+
+    Empty means the repo conforms (no on-disk spec, or code matches it). Raises LookupError if
+    no adapter matches the repo (caller decides whether to skip or fail).
+    """
+    adapter = adapters.select(repo, args.adapter)
+    return [n.path for n, _ in spec_gaps(repo, extract_all(adapter, repo))]
 
 
 def _apply_repo(repo: Path, args) -> int:
@@ -148,6 +161,27 @@ def _derive_platform(args, generated_at: str) -> int:
     # raised is in the census but not in records).
     repos_used = sorted(r for r, _ in records)
     aggs = aggregate(records, specs, authored_signals())
+
+    # Conformance gate: measure code against authored platform.toml requirements; write nothing.
+    if args.gate:
+        conf = conformance(aggs)
+        if not conf.required:
+            print(f"clean - no authored requirements in platform.toml (nothing to gate); "
+                  f"scanned {len(repos_used)} repos")
+            return 0
+        if not conf.violating_signals:
+            print(f"clean - all {len(conf.required)} authored requirement(s) hold across "
+                  f"{len(repos_used)} repos")
+            return 0
+        print(f"VIOLATION - {len(conf.violating_signals)} authored requirement(s) violated "
+              f"across {len(conf.repos_in_violation)} repo(s):")
+        for a in conf.violating_signals:
+            violators = ", ".join(f"{r}=`{_disp(v)}`" for r, v in a.violators())
+            print(f"  {a.spec.label}: REQUIRED `{_disp(a.authored)}` — {violators}")
+        print(f"repos in violation: {', '.join(conf.repos_in_violation)}")
+        print("run: uv run systemmodel --platform   (for the full report)")
+        return 1
+
     nodes = render_platform(aggs, census, agg_kinds, repos_used, adapters_used)
     root = platform_model_root()
     result = render(root, nodes, adapter="+".join(sorted(adapters_used)), target="platform",
@@ -190,6 +224,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="print the plan without writing")
     parser.add_argument("--check", action="store_true",
                         help="report drift vs the checked-in model without writing; exit 1 if stale")
+    parser.add_argument("--gate", action="store_true",
+                        help="conformance gate: exit 1 if code violates authored intent — a repo's "
+                             "edited spec (repo/--all) or platform.toml requirements (--platform). "
+                             "Report only; writes nothing")
     parser.add_argument("--apply", action="store_true",
                         help="spec -> code: diff the edited on-disk model against the code and emit "
                              "a change brief (does not edit code)")
@@ -224,11 +262,40 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--auto drives an agent from the brief; --apply only emits it — use one")
     if args.auto and not args.repo:
         parser.error("--auto requires a repo name")
+    if args.gate and args.check:
+        parser.error("--check (staleness) and --gate (conformance) are separate checks; run each")
+    if args.gate and args.apply:
+        parser.error("--apply emits the change brief; --gate checks the same gap with an exit code — use one")
+    if args.gate and args.auto:
+        parser.error("--auto drives an agent to close the gap; --gate only checks it — use one")
 
     generated_at = datetime.now().isoformat(timespec="seconds")
 
     if args.platform:
         return _derive_platform(args, generated_at)
+
+    # ---- batch: --all --gate ----
+    if args.all and args.gate:
+        violated = skipped = errored = checked = 0
+        for repo in _candidate_repos():
+            try:
+                paths = _gate_repo(repo, args)
+            except LookupError:
+                skipped += 1
+                continue
+            except Exception as e:  # keep the batch going; report the repo that failed
+                errored += 1
+                print(f"  {repo.name:24} ERROR {type(e).__name__}: {e}", file=sys.stderr)
+                continue
+            checked += 1
+            if paths:
+                violated += 1
+                print(f"  {repo.name:24} VIOLATION  differs from spec in {', '.join(paths)}")
+            else:
+                print(f"  {repo.name:24} ok")
+        print(f"\n{checked} checked, {skipped} skipped (no adapter), {errored} errored, "
+              f"{violated} in violation")
+        return 1 if (violated or errored) else 0
 
     # ---- batch: --all ----
     if args.all:
@@ -265,6 +332,19 @@ def main(argv: list[str] | None = None) -> int:
     if not repo.exists():
         print(f"error: repo path does not exist: {repo}", file=sys.stderr)
         return 2
+
+    if args.gate:
+        try:
+            paths = _gate_repo(repo, args)
+        except LookupError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        if paths:
+            print(f"VIOLATION - {repo.name}: code differs from spec in {', '.join(paths)}")
+            print(f"run: uv run systemmodel {repo.name} --apply   (for the change brief)")
+            return 1
+        print(f"clean - {repo.name} code conforms to its spec")
+        return 0
 
     if args.apply:
         return _apply_repo(repo, args)

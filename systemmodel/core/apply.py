@@ -27,10 +27,12 @@ def _strip_frontmatter(text: str) -> str:
     return text
 
 
-def build_brief(repo: Path, nodes: list[Node]) -> str | None:
-    """Diff the edited on-disk model (desired) against freshly-derived nodes (current).
+def spec_gaps(repo: Path, nodes: list[Node]) -> list[tuple[Node, list[str]]]:
+    """(node, unified-diff) for each on-disk model doc that differs from derived code.
 
-    Returns a change-brief string, or None if the code already matches the spec.
+    The `derived ≠ authored` gap per document: the on-disk model is the desired spec, `nodes`
+    is the freshly-derived current state. Empty when there's no model on disk (nothing authored)
+    or the code already matches the spec.
     """
     root = model_root(repo)
     changed: list[tuple[Node, list[str]]] = []
@@ -47,7 +49,15 @@ def build_brief(repo: Path, nodes: list[Node]) -> str | None:
             fromfile=f"current/{node.path}", tofile=f"desired/{node.path}", lineterm="",
         )
         changed.append((node, list(diff)))
+    return changed
 
+
+def build_brief(repo: Path, nodes: list[Node]) -> str | None:
+    """Diff the edited on-disk model (desired) against freshly-derived nodes (current).
+
+    Returns a change-brief string, or None if the code already matches the spec.
+    """
+    changed = spec_gaps(repo, nodes)
     if not changed:
         return None
 

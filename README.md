@@ -44,12 +44,15 @@ uv run systemmodel <repo> --dry-run    # preview, write nothing
 uv run systemmodel <repo> --check      # is the model stale vs the code? exit 1 if so
 uv run systemmodel <repo> --apply      # spec -> code: emit a change brief from the edited model
 uv run systemmodel <repo> --auto       # spec -> code: drive an agent from the brief, then verify
+uv run systemmodel <repo> --gate       # conformance: exit 1 if code violates its edited spec
 
 # whole platform
 uv run systemmodel --all               # derive every auto-detected repo in the container
 uv run systemmodel --all --check       # staleness check across all repos (for CI)
+uv run systemmodel --all --gate        # conformance check across all repos (for CI)
 uv run systemmodel --platform          # L0 platform model -> $SYSTEMMODEL_DIR/ (root)
 uv run systemmodel --platform --check
+uv run systemmodel --platform --gate   # exit 1 if platform.toml requirements are violated
 ```
 
 `<repo>` is a folder name under the container dir (this repo's parent, or `$DEV_DIR`) or an
@@ -62,6 +65,13 @@ repo's model has drifted from its code:
 ```
 uv run systemmodel "$(basename "$PWD")" --check
 ```
+
+`--check` and `--gate` are two **different axes** — run both in CI: `--check` asks *is the committed
+model stale vs the code?* (drift); `--gate` asks *does the code satisfy authored intent?*
+(conformance). A model can be perfectly fresh yet still violate an authored requirement, so a green
+`--check` doesn't imply a green `--gate`. Both write nothing and exit 1 on failure. `--gate` reads
+authored intent from `platform.toml` requirements (`--platform`) and from a repo's hand-edited spec
+(repo / `--all`); with no authored intent it's a no-op pass.
 
 (Equivalent without uv: `python -m systemmodel.derive <repo> ...`.)
 
@@ -197,7 +207,9 @@ envelope.
 2. **Authoring + drift** — *platform-level done* (authored `[invariants]`/`[conventions]`); *spec→code
    done* (`--apply` emits a change brief, `--auto` drives an agent from it and re-derives to verify).
    Next: a formal per-repo spec format.
-3. **Conformance gate** — turn authored violations / apply-briefs into a failing exit code, wired into the test-result pipeline.
+3. **Conformance gate** — *exit code done* (`--gate` fails on authored platform.toml violations and
+   per-repo apply gaps). Next: wire it into the test-result pipeline (needs a conformance suite
+   `kind` across the event + testing services).
 4. **Graph/dashboard projection** over the model.
 
 ## Known limitations
@@ -206,5 +218,5 @@ envelope.
   unconventional layouts may be partially captured.
 - Only the `micronaut_groovy` adapter exists, so repos without Micronaut/Groovy markers (e.g. some
   pure-Java shared libraries) aren't detected/classified at all — they'd need their own adapter.
-- No conformance gate yet — authored violations / apply-briefs don't produce a CI-failing exit
-  code wired into the test-result pipeline (roadmap item 3).
+- The conformance gate (`--gate`) produces a failing exit code, but isn't yet wired into the
+  test-result pipeline as a suite result (roadmap item 3).
