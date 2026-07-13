@@ -7,6 +7,31 @@ agents) *read* it to understand current system state at machine speed, and — i
 This repo is a standalone product: it targets the Trevorism platform first, but is designed to
 apply to other software systems via pluggable adapters.
 
+## Where the model lives
+
+The model is written to a **standalone directory**, not into each target repo. By default that's
+`C:/systemmodel` (a sibling of the container dir); override it with the `SYSTEMMODEL_DIR`
+environment variable. The **root** holds the L0 platform model plus the authored `platform.toml`;
+each repo's model lives in a **flat subdirectory named after the repo**:
+
+```
+$SYSTEMMODEL_DIR/            # e.g. C:/systemmodel
+  platform.toml             # authored policy (see below)
+  platform.md               # L0 platform model
+  invariants.md
+  conventions.md
+  MANIFEST.json             # platform manifest
+  <repo>/                   # one subdir per repo
+    service.md
+    modules/…
+    conventions.md
+    invariants.md
+    MANIFEST.json
+```
+
+Target repos stay pristine — nothing is written into them. The model is *derived* (code is truth),
+so there's no data to migrate: point the tool at a machine and re-derive.
+
 ## Usage
 
 Prerequisite: [uv](https://docs.astral.sh/uv/). No install or venv activation needed — `uv run`
@@ -14,7 +39,7 @@ builds and runs it (the first run creates `.venv`; after that it's instant).
 
 ```
 # one repo
-uv run systemmodel <repo>              # derive <repo>/.systemmodel/  (code -> model)
+uv run systemmodel <repo>              # derive $SYSTEMMODEL_DIR/<repo>/  (code -> model)
 uv run systemmodel <repo> --dry-run    # preview, write nothing
 uv run systemmodel <repo> --check      # is the model stale vs the code? exit 1 if so
 uv run systemmodel <repo> --apply      # spec -> code: emit a change brief from the edited model
@@ -23,15 +48,16 @@ uv run systemmodel <repo> --auto       # spec -> code: drive an agent from the b
 # whole platform
 uv run systemmodel --all               # derive every auto-detected repo in the container
 uv run systemmodel --all --check       # staleness check across all repos (for CI)
-uv run systemmodel --platform          # L0 platform model -> system-model/.systemmodel/
+uv run systemmodel --platform          # L0 platform model -> $SYSTEMMODEL_DIR/ (root)
 uv run systemmodel --platform --check
 ```
 
 `<repo>` is a folder name under the container dir (this repo's parent, or `$DEV_DIR`) or an
-absolute path — e.g. `uv run systemmodel testing`.
+absolute path — e.g. `uv run systemmodel testing`. The model output dir is `$SYSTEMMODEL_DIR`
+(default `C:/systemmodel`).
 
 Keep models honest by wiring `--check` into CI or a pre-commit hook — it fails the build when a
-repo's `.systemmodel/` has drifted from its code:
+repo's model has drifted from its code:
 
 ```
 uv run systemmodel "$(basename "$PWD")" --check
@@ -46,14 +72,15 @@ uv run systemmodel "$(basename "$PWD")" --check
   is the signal — a routed human decision: change the code, or change the spec.
 - **One hierarchy:** **L0 platform (cross-repo)** → **L1 service → L2 module → L3 convention →
   L4 invariant**.
-- The model is a peer to the code: it is written **into the target repo** at `.systemmodel/`, so it
-  lands in the same diff/PR when code changes and drift is visible in review.
+- The model is a peer to the code, kept in a **standalone directory** (`$SYSTEMMODEL_DIR`, default
+  `C:/systemmodel`) rather than embedded in each repo — one place to read the whole platform, and
+  target repos stay pristine.
 
 ## Two altitudes: platform vs repo
 
 Some facts belong to the **platform**, not any one repo (security enabled, HTTPS, JDK pin, coverage
-gate). Those live once in the **L0 platform model** at `system-model/.systemmodel/` — the platform's
-`~/.claude` to a repo's project `.claude`. It is *derived by aggregation*: `--platform` reads every
+gate). Those live once in the **L0 platform model** at the standalone root (`$SYSTEMMODEL_DIR/`) —
+the platform's `~/.claude` to a repo's project `.claude`. It is *derived by aggregation*: `--platform` reads every
 repo's code and, per signal, records how many repos satisfy it and **which ones don't** (outliers =
 drift from the norm). Each repo's `invariants.md` then shows its own values under **Platform-governed**
 (pointing here) and keeps only genuinely local facts under **Repo-specific**.
@@ -65,8 +92,9 @@ Platform invariants only make sense for deployable **services**, so every repo i
 (App-Engine descriptor + Micronaut application plugin = service; publishes a jar/plugin = library;
 `*-tester` / `template-*` by name; source with none of these = experiment). The `--platform` model
 aggregates invariants over **services only** and publishes a **repo census**, so libraries and
-experiments no longer show up as false outliers. `platform.toml` (optional, in the repo root)
-overrides a repo's kind when intent differs from structure, or widens which kinds get aggregated.
+experiments no longer show up as false outliers. `platform.toml` (optional, at the standalone
+model root) overrides a repo's kind when intent differs from structure, or widens which kinds get
+aggregated.
 
 ### Authored intent (descriptive vs prescriptive)
 
@@ -95,13 +123,13 @@ observed norm. (This is platform-level authoring; per-repo authored specs are a 
 
 The model reconciles code and intent, and **you pick which side wins by the command you run**:
 
-- **`derive` — code is truth.** Re-reads the code and (re)writes `.systemmodel/`. Use it after the
-  code changes.
-- **`--apply` — spec is truth.** You edit the `.systemmodel/*.md` to describe *desired* state; this
+- **`derive` — code is truth.** Re-reads the code and (re)writes the repo's model under
+  `$SYSTEMMODEL_DIR/<repo>/`. Use it after the code changes.
+- **`--apply` — spec is truth.** You edit the model's `*.md` to describe *desired* state; this
   re-derives the current code **in memory** (never overwriting your edits), diffs it against your
-  edited spec, and emits a **change brief** (`<repo>/change-brief.md` + stdout): per changed
-  document, the `current → desired` diff and the **source files to edit** (from each node's
-  `derived_from`), with the acceptance criterion `uv run systemmodel <repo> --check` is clean.
+  edited spec, and emits a **change brief** (`$SYSTEMMODEL_DIR/<repo>/change-brief.md` + stdout):
+  per changed document, the `current → desired` diff and the **source files to edit** (from each
+  node's `derived_from`), with the acceptance criterion `uv run systemmodel <repo> --check` is clean.
 
 system-model does **not** edit code — the brief is handed to an agent (Claude Code) or the developer,
 who makes the change; re-derivation is the acceptance test that the change conformed.
@@ -121,14 +149,18 @@ roadmap.
 
 ## How it stays honest
 
-The model lives in the target repo and is only truth if it's regenerated when the code changes.
-`--check` re-derives in memory, compares content hashes to the checked-in `MANIFEST.json`, prints
-what drifted (`added`/`changed`/`removed`/`stale file`), and exits non-zero if anything is stale —
-so it drops straight into a pre-commit hook or CI step. `--all` turns platform-wide rollout/refresh
-into one command: it walks the container, runs each adapter's `detect()`, and derives (or `--check`s)
-every repo an adapter matches, skipping the rest.
+The model is only truth if it's regenerated when the code changes. `--check` re-derives in memory,
+compares content hashes to the model's `MANIFEST.json`, prints what drifted
+(`added`/`changed`/`removed`/`stale file`), and exits non-zero if anything is stale — so it drops
+straight into a pre-commit hook or CI step. `--all` turns platform-wide rollout/refresh into one
+command: it walks the container, runs each adapter's `detect()`, and derives (or `--check`s) every
+repo an adapter matches, skipping the rest.
 
-## Output layout (`<repo>/.systemmodel/`)
+Pruning is manifest-driven: a re-run removes only the files a prior run recorded in `MANIFEST.json`
+and no longer produces — so the per-repo subdirs and `platform.toml` that share the standalone root
+are never touched by another target's run.
+
+## Output layout (`$SYSTEMMODEL_DIR/<repo>/`)
 
 ```
 service.md            # L1  service identity, version (+ drift), host, liveness

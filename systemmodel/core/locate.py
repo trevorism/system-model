@@ -17,7 +17,7 @@ _SKIPPED_DIR_NAMES = {
 
 
 def platform_root() -> Path:
-    """The system-model repo root (holds platform.toml and the L0 .systemmodel/)."""
+    """The system-model repo root (this tool's own source; still anchors dev_dir())."""
     # locate.py -> core -> systemmodel -> <this repo>
     return Path(__file__).resolve().parents[2]
 
@@ -28,6 +28,26 @@ def dev_dir() -> Path:
     if env:
         return Path(env)
     return platform_root().parent
+
+
+def systemmodel_dir() -> Path:
+    """Standalone dir holding all derived models (platform at root, one subdir per repo).
+
+    Default is a sibling of the container dir named `systemmodel` (C:/dev -> C:/systemmodel);
+    override with the SYSTEMMODEL_DIR environment variable.
+    """
+    env = os.environ.get("SYSTEMMODEL_DIR")
+    return Path(env) if env else dev_dir().parent / "systemmodel"
+
+
+def model_root(repo: Path) -> Path:
+    """Where a repo's model is written: <systemmodel_dir>/<repo name>."""
+    return systemmodel_dir() / repo.name
+
+
+def platform_model_root() -> Path:
+    """Where the L0 platform model is written: the standalone dir root itself."""
+    return systemmodel_dir()
 
 
 def _iter_search_dirs(root: Path, max_depth: int = _MAX_SEARCH_DEPTH):

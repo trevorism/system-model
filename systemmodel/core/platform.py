@@ -154,7 +154,7 @@ def render_platform(
         "# Platform model (L0)",
         "",
         "System-wide invariants and conventions, derived by aggregating the code of every "
-        "repo in the platform. This is the platform peer of a repo's `.systemmodel/` — the "
+        "repo in the platform. This is the platform peer of a repo's model — the "
         "`~/.claude` to a repo's project config.",
         "",
         f"- **Repos scanned:** {len(all_repos)}",

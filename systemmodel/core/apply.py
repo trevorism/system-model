@@ -1,7 +1,7 @@
 """`apply`: turn an edited model (spec) into a change brief for an agent.
 
 The reverse of derivation. `derive` treats code as truth and (re)writes the model; `apply`
-treats the on-disk model as *intent* — the developer edited `.systemmodel/*.md` to describe
+treats the on-disk model as *intent* — the developer edited the model's `*.md` to describe
 desired state — and emits the `derived ≠ authored` gap as human/agent-actionable instructions.
 
 system-model does not edit code itself. It computes the gap and points at the exact source
@@ -13,7 +13,7 @@ from __future__ import annotations
 import difflib
 from pathlib import Path
 
-from systemmodel.core.render import MODEL_DIRNAME
+from systemmodel.core.locate import model_root
 from systemmodel.core.schema import Node
 
 
@@ -32,7 +32,7 @@ def build_brief(repo: Path, nodes: list[Node]) -> str | None:
 
     Returns a change-brief string, or None if the code already matches the spec.
     """
-    root = repo / MODEL_DIRNAME
+    root = model_root(repo)
     changed: list[tuple[Node, list[str]]] = []
     for node in nodes:
         on_disk = root / node.path

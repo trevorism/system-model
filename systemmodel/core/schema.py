@@ -30,7 +30,7 @@ class Level(str, Enum):
 
 @dataclass
 class Node:
-    """A single node of the model, rendered to one Markdown file under .systemmodel/.
+    """A single node of the model, rendered to one Markdown file under the model root.
 
     `path` is the file location relative to the model root (e.g. "modules/controllers.md").
     `derived_from` is the provenance: repo-relative source paths this node was derived from.

@@ -17,14 +17,14 @@ from pathlib import Path
 
 from systemmodel.core.adapter import Adapter, extract_all
 from systemmodel.core.apply import build_brief
-from systemmodel.core.render import MODEL_DIRNAME
+from systemmodel.core.locate import model_root
 
 _AGENT_FOOTER = (
     "\n\n---\n"
     "You are being run non-interactively to satisfy the change brief above. Edit ONLY this "
-    "repo's code to close the gap. Do NOT edit anything under `.systemmodel/` — that is the "
-    "spec, not the target. Acceptance is `uv run systemmodel {repo} --check` reporting clean "
-    "(re-derivation reproduces the spec)."
+    "repo's code to close the gap. The system model is the spec, not the target — it lives in a "
+    "standalone directory outside this repo, so do not attempt to edit it. Acceptance is "
+    "`uv run systemmodel {repo} --check` reporting clean (re-derivation reproduces the spec)."
 )
 
 
@@ -65,7 +65,7 @@ def run_auto(repo: Path, adapter: Adapter, *, max_iters: int = 3, dangerous: boo
     Returns a process exit code: 0 converged / nothing to do, 1 residual drift after the cap,
     2 a precondition failed (no model, dirty tree, claude missing).
     """
-    root = repo / MODEL_DIRNAME
+    root = model_root(repo)
     if not root.exists():
         on_log(f"error: no model at {root}\n"
                f"       run `uv run systemmodel {repo.name}` first, then edit the .md files and "
@@ -100,7 +100,7 @@ def run_auto(repo: Path, adapter: Adapter, *, max_iters: int = 3, dangerous: boo
                f"(up to {max_iters} iteration(s), re-deriving after each) ---")
         return 0
 
-    out = repo / "change-brief.md"
+    out = root / "change-brief.md"
     for i in range(1, max_iters + 1):
         on_log(f"\n=== --auto iteration {i}/{max_iters} for {repo.name} ===")
         out.write_text(brief, encoding="utf-8", newline="\n")

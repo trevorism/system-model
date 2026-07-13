@@ -1,7 +1,9 @@
-"""Render Nodes to the .systemmodel/ doc tree + MANIFEST.json.
+"""Render Nodes to a model doc tree + MANIFEST.json.
 
 System-agnostic: it writes whatever Nodes an adapter produced, wrapping each in the
-frontmatter envelope and recording provenance + content hash in the manifest.
+frontmatter envelope and recording provenance + content hash in the manifest. The caller
+decides the output root (a repo's model dir, or the platform root); this module just writes
+there and prunes only the files it previously wrote.
 """
 from __future__ import annotations
 
@@ -11,8 +13,6 @@ from pathlib import Path
 
 from systemmodel.core.schema import GENERATOR_VERSION, Node, frontmatter
 
-MODEL_DIRNAME = ".systemmodel"
-
 
 @dataclass
 class RenderResult:
@@ -21,6 +21,17 @@ class RenderResult:
     manifest: dict
     dry_run: bool
     pruned: list[str]
+
+
+def read_manifest(root: Path) -> dict | None:
+    """The MANIFEST.json at a model root as a dict, or None if absent/unreadable."""
+    manifest = root / "MANIFEST.json"
+    if not manifest.exists():
+        return None
+    try:
+        return json.loads(manifest.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
 
 
 def _document(node: Node, *, adapter: str) -> str:
@@ -52,17 +63,23 @@ def build_manifest(nodes: list[Node], *, adapter: str, target: str, generated_at
 
 
 def render(
-    target_repo: Path,
+    out_root: Path,
     nodes: list[Node],
     *,
     adapter: str,
+    target: str,
     generated_at: str,
     dry_run: bool = False,
 ) -> RenderResult:
-    """Write the model tree into <target_repo>/.systemmodel/ (or preview if dry_run)."""
-    root = target_repo / MODEL_DIRNAME
+    """Write the model tree into `out_root` (or preview if dry_run).
+
+    `target` is recorded in the manifest. Pruning is manifest-driven: only files this model
+    wrote on a previous run (per the on-disk MANIFEST.json) are removed. Unrelated files —
+    e.g. platform.toml or sibling repo subdirs sharing the standalone root — are never touched.
+    """
+    root = out_root
     manifest = build_manifest(
-        nodes, adapter=adapter, target=target_repo.name, generated_at=generated_at
+        nodes, adapter=adapter, target=target, generated_at=generated_at
     )
 
     documents: dict[str, str] = {}
@@ -70,17 +87,25 @@ def render(
         documents[node.path] = _document(node, adapter=adapter)
     documents["MANIFEST.json"] = json.dumps(manifest, indent=2) + "\n"
 
-    # Prune files from a previous run that this run no longer produces, so the tree on
-    # disk always matches the manifest (no silently stale, misleading nodes).
-    pruned: list[str] = []
-    if root.exists():
-        for existing in root.rglob("*"):
-            if existing.is_file():
-                rel = existing.relative_to(root).as_posix()
-                if rel not in documents:
-                    pruned.append(rel)
-                    if not dry_run:
-                        existing.unlink()
+    # Prune only what a previous run recorded in the manifest and this run no longer
+    # produces, so the tree matches the manifest without scanning (or deleting) anything
+    # else that happens to live under a shared root.
+    old = read_manifest(root)
+    previous = [n["path"] for n in old.get("nodes", [])] + ["MANIFEST.json"] if old else []
+    pruned = sorted(p for p in previous if p not in documents)
+    if not dry_run:
+        for rel in pruned:
+            dest = root / rel
+            if dest.is_file():
+                dest.unlink()
+            # Remove now-empty parent dirs left behind (deepest first, up to the root).
+            parent = dest.parent
+            while parent != root and parent.is_dir():
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break  # not empty — keep it
+                parent = parent.parent
 
     written: list[str] = []
     for rel, content in documents.items():
@@ -91,14 +116,5 @@ def render(
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8", newline="\n")
 
-    # Remove now-empty directories left behind by pruning (deepest first).
-    if not dry_run and root.exists():
-        for d in sorted((p for p in root.rglob("*") if p.is_dir()),
-                        key=lambda p: len(p.parts), reverse=True):
-            try:
-                d.rmdir()
-            except OSError:
-                pass  # not empty — keep it
-
     return RenderResult(root=root, files=written, manifest=manifest,
-                        dry_run=dry_run, pruned=sorted(pruned))
+                        dry_run=dry_run, pruned=pruned)

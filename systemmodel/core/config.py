@@ -1,22 +1,23 @@
-"""Authored platform policy: `system-model/platform.toml` (optional).
+"""Authored platform policy: `platform.toml` at the standalone model root (optional).
 
 Small hand-authored config that overrides what can't be derived from code — chiefly repo
 *intent* (e.g. an experiment that structurally looks like a service). Everything else is
-derived; this file is only for exceptions and policy.
+derived; this file is only for exceptions and policy. It lives at the root of the standalone
+model dir, alongside the derived platform model.
 """
 from __future__ import annotations
 
 import tomllib
 from functools import lru_cache
 
-from systemmodel.core.locate import platform_root
+from systemmodel.core.locate import systemmodel_dir
 
 # Which kinds the platform model aggregates invariants/conventions over, by default.
 DEFAULT_AGGREGATE_KINDS = ("service",)
 
 
 def config_path():
-    return platform_root() / "platform.toml"
+    return systemmodel_dir() / "platform.toml"
 
 
 @lru_cache(maxsize=1)

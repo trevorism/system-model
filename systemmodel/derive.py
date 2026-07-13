@@ -1,10 +1,10 @@
-"""CLI: derive a system model for a target repo and write it to <repo>/.systemmodel/.
+"""CLI: derive a system model for a target repo and write it to the standalone model dir.
 
-    uv run systemmodel <repo> [--dry-run] [--adapter NAME]
+    uv run systemmodel <repo> [--dry-run] [--adapter NAME]   # -> $SYSTEMMODEL_DIR/<repo>/
     uv run systemmodel <repo> --check      # drift check, no writes, exit 1 if stale
     uv run systemmodel --all               # every auto-detected repo in the container
     uv run systemmodel --all --check       # platform-wide staleness check (CI)
-    uv run systemmodel --platform          # L0 platform model -> system-model/.systemmodel/
+    uv run systemmodel --platform          # L0 platform model -> $SYSTEMMODEL_DIR/ (root)
     uv run systemmodel <repo> --apply      # spec -> code: emit a change brief from the edited model
     uv run systemmodel <repo> --auto       # spec -> code: drive an agent from the brief, then verify
 
@@ -16,7 +16,6 @@ knowledge lives in the chosen adapter.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -26,25 +25,14 @@ from systemmodel.core.adapter import extract_all
 from systemmodel.core.apply import build_brief
 from systemmodel.core.auto import run_auto
 from systemmodel.core.config import aggregate_kinds, authored_signals
-from systemmodel.core.locate import dev_dir, platform_root, resolve_repo
+from systemmodel.core.locate import dev_dir, model_root, platform_model_root, resolve_repo
 from systemmodel.core.platform import aggregate, render_platform
-from systemmodel.core.render import MODEL_DIRNAME, render
+from systemmodel.core.render import read_manifest, render
 
 
-def _load_manifest(repo: Path) -> dict | None:
-    """A repo's checked-in MANIFEST.json as a dict, or None if absent/unreadable."""
-    manifest = repo / MODEL_DIRNAME / "MANIFEST.json"
-    if not manifest.exists():
-        return None
-    try:
-        return json.loads(manifest.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
-        return None
-
-
-def _drift(repo: Path, new_manifest: dict, pruned: list[str]) -> list[str]:
+def _drift(mroot: Path, new_manifest: dict, pruned: list[str]) -> list[str]:
     """Human-readable drift lines comparing a freshly derived model to what's on disk."""
-    old = _load_manifest(repo)
+    old = read_manifest(mroot)
     if old is None:
         return ["no model on disk (never generated)"]
     lines: list[str] = []
@@ -71,11 +59,12 @@ def _process_repo(repo: Path, args, generated_at: str) -> tuple[str, list[str], 
     """Derive one repo. Returns (status, detail_lines, adapter_name)."""
     adapter = adapters.select(repo, args.adapter)
     nodes = extract_all(adapter, repo)
+    mroot = model_root(repo)
     # --check never writes; it renders in dry-run to compute the new manifest + stale files.
-    result = render(repo, nodes, adapter=adapter.name, generated_at=generated_at,
-                    dry_run=args.dry_run or args.check)
+    result = render(mroot, nodes, adapter=adapter.name, target=repo.name,
+                    generated_at=generated_at, dry_run=args.dry_run or args.check)
     if args.check:
-        drift = _drift(repo, result.manifest, result.pruned)
+        drift = _drift(mroot, result.manifest, result.pruned)
         return ("drift" if drift else "clean", drift, adapter.name)
     detail = [f"[{n.level.value}] {n.path} ({n.content_hash()})" for n in nodes]
     if result.pruned:
@@ -92,7 +81,7 @@ def _candidate_repos() -> list[Path]:
 
 def _apply_repo(repo: Path, args) -> int:
     """Spec -> change brief: diff the edited on-disk model against derived code, emit instructions."""
-    root = repo / MODEL_DIRNAME
+    root = model_root(repo)
     if not root.exists():
         print(f"error: no model at {root}\n"
               f"       run `uv run systemmodel {repo.name}` first, then edit the .md files and "
@@ -112,7 +101,7 @@ def _apply_repo(repo: Path, args) -> int:
     if brief is None:
         print(f"{repo.name}: code already matches the spec — nothing to apply.")
         return 0
-    out = repo / "change-brief.md"
+    out = root / "change-brief.md"
     out.write_text(brief, encoding="utf-8", newline="\n")
     print(brief)
     print(f"\n(wrote {out})")
@@ -120,7 +109,7 @@ def _apply_repo(repo: Path, args) -> int:
 
 
 def _derive_platform(args, generated_at: str) -> int:
-    """Aggregate platform signals across all repos into the L0 model in system-model/.systemmodel."""
+    """Aggregate platform signals across all repos into the L0 model at the standalone root."""
     agg_kinds = aggregate_kinds()
     census: dict[str, list[str]] = {}
     records: list[tuple[str, dict]] = []
@@ -160,8 +149,8 @@ def _derive_platform(args, generated_at: str) -> int:
     repos_used = sorted(r for r, _ in records)
     aggs = aggregate(records, specs, authored_signals())
     nodes = render_platform(aggs, census, agg_kinds, repos_used, adapters_used)
-    root = platform_root()
-    result = render(root, nodes, adapter="+".join(sorted(adapters_used)),
+    root = platform_model_root()
+    result = render(root, nodes, adapter="+".join(sorted(adapters_used)), target="platform",
                     generated_at=generated_at, dry_run=args.dry_run or args.check)
 
     if args.check:
@@ -175,7 +164,7 @@ def _derive_platform(args, generated_at: str) -> int:
         return 0
 
     verb = "would write" if args.dry_run else "wrote"
-    print(f"platform model: {verb} under {root / MODEL_DIRNAME} "
+    print(f"platform model: {verb} under {root} "
           f"from {len(repos_used)} repos ({', '.join(sorted(adapters_used))})")
     for n in nodes:
         print(f"  [{n.level.value}] {n.path} ({n.content_hash()})")
@@ -196,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("repo", nargs="?", help="repo folder name (under DEV_DIR) or absolute path")
     parser.add_argument("--all", action="store_true", help="process every auto-detected repo in the container")
     parser.add_argument("--platform", action="store_true",
-                        help="derive the L0 platform model into system-model/.systemmodel from all repos")
+                        help="derive the L0 platform model into the standalone model root from all repos")
     parser.add_argument("--adapter", help="force a specific adapter instead of auto-detect")
     parser.add_argument("--dry-run", action="store_true", help="print the plan without writing")
     parser.add_argument("--check", action="store_true",
@@ -298,20 +287,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: failed to derive {repo.name}: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
 
+    mroot = model_root(repo)
     if args.check:
         if status == "drift":
-            print(f"DRIFT - {repo.name}/.systemmodel is stale vs code:")
+            print(f"DRIFT - {mroot} is stale vs code:")
             for line in detail:
                 print(f"  {line}")
             print("run: uv run systemmodel " + repo.name)
             return 1
-        print(f"clean - {repo.name}/.systemmodel matches code")
+        print(f"clean - {mroot} matches code")
         return 0
 
     verb = "would write" if args.dry_run else "wrote"
     print(f"adapter: {adapter_name}")
     print(f"target : {repo}")
-    print(f"{verb} model under {repo / MODEL_DIRNAME}:")
+    print(f"{verb} model under {mroot}:")
     for line in detail:
         print(f"  {line}")
     return 0

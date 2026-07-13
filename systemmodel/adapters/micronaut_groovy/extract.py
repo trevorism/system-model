@@ -731,7 +731,7 @@ class MicronautGroovyAdapter:
         lines = ["# Invariants (L4)", "",
                  "## Platform-governed", ""]
         if kind in aggregate_kinds():
-            lines += ["Governed by the platform model (`system-model/.systemmodel/`); the norm and "
+            lines += ["Governed by the platform model (at the standalone model root); the norm and "
                       "outliers live there. This repo's values:", ""]
             for spec in PLATFORM_SIGNAL_SPECS:
                 lines.append(f"- **{spec.label}:** {_fmt_signal(spec, sig.get(spec.key))}")
