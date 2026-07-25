@@ -32,6 +32,7 @@ from systemmodel.core.graph import service_graph
 from systemmodel.core.locate import dev_dir, model_root, platform_model_root, resolve_repo
 from systemmodel.core.platform import (
     aggregate, conformance, display_value as _disp, exception_lines, render_platform,
+    trailing_conventions,
 )
 from systemmodel.core.render import read_manifest, render
 from systemmodel.core.synth import resolve as synth_resolve
@@ -112,6 +113,43 @@ def _gate_repo(repo: Path, args) -> list[str]:
     return [n.path for n, _ in spec_gaps(repo, extract_all(adapter, repo))]
 
 
+def _platform_aggregates(args) -> dict:
+    """Aggregate platform signals across services, for advisory comparison against one repo."""
+    agg_kinds = aggregate_kinds()
+    records: list[tuple[str, dict]] = []
+    specs: dict = {}
+    for candidate in _candidate_repos():
+        try:
+            adapter = adapters.select(candidate, args.adapter)
+        except LookupError:
+            continue
+        classify = getattr(adapter, "classify", None)
+        get_sigs = getattr(adapter, "platform_signals", None)
+        get_specs = getattr(adapter, "platform_signal_specs", None)
+        if not (callable(classify) and callable(get_sigs) and callable(get_specs)):
+            continue
+        try:
+            if classify(candidate) not in agg_kinds:
+                continue
+            records.append((candidate.name, get_sigs(candidate)))
+            for spec in get_specs():
+                specs[spec.key] = spec
+        except Exception:
+            continue
+    if not records:
+        return {}
+    return aggregate(records, specs, authored_signals(), authored_exceptions())
+
+
+def _advisories(repo: Path, args) -> list[str]:
+    try:
+        aggs = _platform_aggregates(args)
+    except Exception:
+        return []
+    return [f"**{label}:** `{_disp(value)}` — most services are on `{_disp(norm)}`"
+            for label, value, norm in trailing_conventions(repo.name, aggs)]
+
+
 def _apply_repo(repo: Path, args) -> int:
     """Spec -> change brief: diff the edited on-disk model against derived code, emit instructions."""
     root = model_root(repo)
@@ -130,7 +168,7 @@ def _apply_repo(repo: Path, args) -> int:
         print(f"error: failed to derive {repo.name}: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
 
-    brief = build_brief(repo, nodes)
+    brief = build_brief(repo, nodes, advisories=_advisories(repo, args))
     if brief is None:
         print(f"{repo.name}: code already matches the spec — nothing to apply.")
         return 0

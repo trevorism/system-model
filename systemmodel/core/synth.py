@@ -46,6 +46,20 @@ Hard rules:
 - Claim nothing you did not find in the code.
 - Output ONLY the section body. No preamble, no headings, no code fences, no sign-off.
 
+Dependencies — read this before calling anything self-contained:
+`shared.wiring` carries three separate facts and you must honour all three.
+- `calls` are services named by a literal URL in this repo's own source.
+- `library_calls` are services reached through a shared client library, so the hostname never
+  appears in this repo. THEY ARE REAL DEPENDENCIES. A repo using `Repository` talks to the
+  datastore; one using a `SecureHttpClient` depends on the auth service. Grepping the source
+  will not show them.
+- `consumed_by` is who depends on THIS service.
+
+So: never write that a service is self-contained, standalone, a leaf, or that it "calls nothing"
+unless BOTH `calls` and `library_calls` are empty. Never write that nothing depends on it unless
+`consumed_by` is empty. If `consumed_by` is large this service is infrastructure — say so, and
+say roughly how much of the platform rests on it.
+
 {section_rules}
 
 Evidence scaffold:

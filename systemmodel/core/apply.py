@@ -58,10 +58,12 @@ def spec_gaps(repo: Path, nodes: list[Node]) -> list[tuple[Node, list[str]]]:
     return changed
 
 
-def build_brief(repo: Path, nodes: list[Node]) -> str | None:
+def build_brief(repo: Path, nodes: list[Node], advisories: list[str] | None = None) -> str | None:
     """Diff the edited on-disk model (desired) against freshly-derived nodes (current).
 
-    Returns a change-brief string, or None if the code already matches the spec.
+    Returns a change-brief string, or None if the code already matches the spec. `advisories` are
+    optional non-blocking notes appended at the end — things worth doing while the repo is already
+    open, which are explicitly NOT part of the acceptance criterion.
     """
     changed = spec_gaps(repo, nodes)
     if not changed:
@@ -89,6 +91,17 @@ def build_brief(repo: Path, nodes: list[Node]) -> str | None:
             "```diff",
             *diff,
             "```",
+            "",
+        ]
+    if advisories:
+        lines += [
+            "## While you're here",
+            "",
+            "This repo trails the platform norm on the following. None of it is a violation and "
+            "none of it affects acceptance — but the cheapest moment to close a version gap is "
+            "while the repo is already open.",
+            "",
+            *[f"- {note}" for note in advisories],
             "",
         ]
     return "\n".join(lines)

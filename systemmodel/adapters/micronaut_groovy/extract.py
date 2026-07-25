@@ -27,9 +27,10 @@ PLATFORM_SIGNAL_SPECS = [
     SignalSpec("coverage.gate", "Coverage gate wired into build", "invariant", "bool"),
     SignalSpec("ping.present", "Liveness /ping endpoint", "invariant", "bool"),
     SignalSpec("micronaut.version_aligned", "Micronaut BOM/plugin versions aligned", "invariant", "bool"),
-    SignalSpec("jdk", "JDK version", "convention", "value"),
-    SignalSpec("micronaut.version", "Micronaut version (BOM)", "convention", "value"),
-    SignalSpec("micronaut.plugin.version", "Micronaut version (application plugin)", "convention", "value"),
+    SignalSpec("jdk", "JDK version", "convention", "value", advisory=True),
+    SignalSpec("micronaut.version", "Micronaut version (BOM)", "convention", "value", advisory=True),
+    SignalSpec("micronaut.plugin.version", "Micronaut version (application plugin)", "convention",
+               "value", advisory=True),
     SignalSpec("test.runtime", "Unit test runtime", "convention", "value"),
     SignalSpec("coverage.minimum", "Coverage minimum", "convention", "value"),
 ]

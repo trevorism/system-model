@@ -21,6 +21,10 @@ class SignalSpec:
     label: str
     kind: str  # "invariant" | "convention"
     type: str  # "bool" | "value"
+    # Signals where matching the newest value in use is unambiguously better, so trailing the
+    # norm is worth a nudge. Not true of every value signal: a repo whose coverage minimum sits
+    # above the norm is ahead of it, and telling it to converge downwards would be bad advice.
+    advisory: bool = False
 
 
 # Sentinel distinguishing "no authored requirement" from an authored value that happens to
@@ -114,6 +118,24 @@ def aggregate(records: list[tuple[str, dict]], specs: dict[str, SignalSpec],
                               authored=authored.get(key, _UNSET),
                               exceptions=dict(exceptions.get(key, {})))
     return aggs
+
+
+def trailing_conventions(repo_name: str, aggs: dict[str, Aggregate]) -> list[tuple[str, object, object]]:
+    """(label, this repo's value, the observed norm) for value signals where the repo trails.
+
+    Deliberately scoped to *unrequired* value signals — dependency versions and the like. Those
+    are not platform violations (see the note in the rendered invariants), so they are never
+    reported as drift; they surface once, in the change brief for a repo someone is already
+    editing, which is when upgrading them is nearly free.
+    """
+    trailing: list[tuple[str, object, object]] = []
+    for agg in aggs.values():
+        if not agg.spec.advisory or agg.is_required or agg.expected is None:
+            continue
+        value = next((v for r, v in agg.pairs if r == repo_name), None)
+        if value is not None and value != agg.expected:
+            trailing.append((agg.spec.label, value, agg.expected))
+    return sorted(trailing, key=lambda t: t[0])
 
 
 def display_value(value: object) -> str:
