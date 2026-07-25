@@ -11,7 +11,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from systemmodel.core.config import aggregate_kinds, repo_kind_override
+from systemmodel.core.evidence import Evidence
 from systemmodel.core.filters import iter_files, read_text
+from systemmodel.core.overlay import synth_anchor
 from systemmodel.core.platform import SignalSpec
 from systemmodel.core.schema import Level, Node
 
@@ -640,6 +642,144 @@ def _md_capabilities(caps: list[Capability], f: dict) -> str:
     return "\n".join(lines)
 
 
+_TREVORISM_HOST = re.compile(r"https://([a-z0-9.-]+\.trevorism\.com)")
+_EVENT_TOPIC = re.compile(r"/event/([A-Za-z][A-Za-z0-9_-]*)")
+_SHARED_LIB = re.compile(r"com\.trevorism:([a-z0-9-]+)")
+
+_PUBLIC_BY_DESIGN_SEGMENTS = {
+    "login", "logout", "google", "microsoft", "oauth", "callback", "refresh",
+    "forgot", "reset", "register", "token", "ping", "help", "version",
+    "authwarmup", "warmup", "webhook", "swagger", "openapi",
+}
+_PUBLIC_BY_DESIGN_HANDLERS = {
+    "ping", "version", "help", "index", "root", "callback", "warmup", "authwarmup",
+}
+
+
+def _is_public_by_design(route: str, handler: str) -> bool:
+    if handler.lower() in _PUBLIC_BY_DESIGN_HANDLERS:
+        return True
+    segments = {s.lower() for s in route.strip("/").split("/") if s and not s.startswith("{")}
+    if segments & _PUBLIC_BY_DESIGN_SEGMENTS:
+        return True
+    return segments <= {"api"}
+
+
+def _wiring(repo: Path) -> dict:
+    own_host = _service_facts(repo).get("host") or ""
+    hosts: set[str] = set()
+    topics: set[str] = set()
+    for path in iter_files(repo, "src/main"):
+        text = read_text(path)
+        if not text:
+            continue
+        hosts.update(_TREVORISM_HOST.findall(text))
+        topics.update(_EVENT_TOPIC.findall(text))
+    hosts.discard(own_host.replace("https://", "").rstrip("/"))
+    build = _read(repo, "build.gradle") or ""
+    libs = {lib for lib in _SHARED_LIB.findall(build) if not lib.endswith("-plugin")}
+    return {
+        "calls": sorted(hosts),
+        "publishes_topics": sorted(topics),
+        "shared_libraries": sorted(libs),
+    }
+
+
+def _risk_notes(repo: Path) -> list[str]:
+    notes: list[str] = []
+    exposed: list[tuple[str, str]] = []
+    for ctrl in _all_controllers(repo):
+        for ep in ctrl.endpoints:
+            if ep.secured or ep.http not in _MUTATING:
+                continue
+            if _is_public_by_design(ep.route, ep.handler):
+                continue
+            exposed.append((f"{ep.http} {ep.route}", ctrl.name))
+    for route, cname in exposed:
+        notes.append(f"`{route}` — unauthenticated write, and not an auth/session flow ({cname}).")
+    if (repo / "src/main/resources/secrets.properties").exists():
+        notes.append("`secrets.properties` present under `src/main/resources` — confirm it is gitignored.")
+    return notes
+
+
+def _md_overview(repo: Path, f: dict, wiring: dict, risks: list[str], evidence_hashes: dict) -> str:
+    title = f"# {f['name']}"
+    if f.get("app_label") and f["app_label"] != f["name"]:
+        title += f" — {f['app_label']}"
+    identity = [f"`{f['name']}`"]
+    if f.get("host"):
+        identity.append(f["host"])
+    if f.get("gcp_project"):
+        identity.append(f"`{f['gcp_project']}`")
+    if f.get("ping"):
+        identity.append(f"liveness `{f['ping']}`")
+    lines = [title, "", " · ".join(identity), "",
+             synth_anchor("purpose", evidence_hashes.get("purpose", "")), ""]
+
+    lines += ["## Requirements", "",
+              synth_anchor("requirements", evidence_hashes.get("requirements", "")), ""]
+
+    lines += ["## Wiring", ""]
+    calls = " · ".join(wiring["calls"]) or "_(nothing outbound)_"
+    lines.append(f"- **calls** → {calls}")
+    if wiring["publishes_topics"]:
+        lines.append(f"- **publishes** → {' · '.join(wiring['publishes_topics'])}")
+    if wiring["shared_libraries"]:
+        lines.append(f"- **libs** → {', '.join(wiring['shared_libraries'])}")
+    lines.append("")
+
+    lines += ["## Watch out", ""]
+    if risks:
+        lines += [f"- {note}" for note in risks]
+    else:
+        lines.append("_Nothing flagged: no unauthenticated writes outside auth flows._")
+    lines += ["", f"<!-- intent:{f['name']} -->", "> intent: _(unspecified)_", "<!-- /intent -->", ""]
+    return "\n".join(lines)
+
+
+def build_evidence(repo: Path) -> Evidence:
+    facts = _service_facts(repo)
+    controllers = _all_controllers(repo)
+    services = _parse_services(repo)
+    domain = _parse_domain(repo)
+    caps = _extract_capabilities(repo)
+    wiring = _wiring(repo)
+
+    shared = {
+        "name": facts.get("name"),
+        "readme_purpose": facts.get("purpose"),
+        "category": facts.get("category"),
+        "host": facts.get("host"),
+        "wiring": wiring,
+    }
+    surface = {
+        "controllers": [
+            {
+                "name": c.name,
+                "file": c.file,
+                "endpoints": [
+                    {"http": e.http, "route": e.route, "handler": e.handler,
+                     "secured": e.secured, "role": e.role, "summary": e.summary}
+                    for e in c.endpoints
+                ],
+            }
+            for c in controllers
+        ],
+        "services": [
+            {"interface": s.interface, "impl": s.impl, "file": s.file,
+             "collaborators": s.collaborators}
+            for s in services
+        ],
+        "domain_types": [{"name": t.name, "file": t.file} for t in domain],
+        "capability_stories": [c.story for c in caps],
+    }
+    return Evidence(
+        target=repo.name,
+        sections={"purpose": {"summary": shared}, "requirements": surface},
+        shared=shared,
+    )
+
+
 def capability_summary(repo: Path) -> dict:
     """Per-repo capability roll-up for the L0 platform capability map."""
     caps = _extract_capabilities(repo)
@@ -833,24 +973,6 @@ class MicronautGroovyAdapter:
     def classify(self, repo: Path) -> str:
         return classify(repo)
 
-    def extract_service(self, repo: Path) -> Node:
-        f = _service_facts(repo)
-        f["kind"] = classify(repo)
-        provenance = [
-            p for p in ["settings.gradle", "README.md", "build.gradle",
-                        "src/main/appengine/app.yaml", "src/main/resources/application.yml",
-                        ".github/workflows/deploy.yml"]
-            if (repo / p).exists()
-        ]
-        app = next((str((x).relative_to(repo).as_posix())
-                    for x in iter_files(repo, "src/main") if x.name == "Application.groovy"), None)
-        if app:
-            provenance.append(app)
-        return Node(
-            level=Level.L1, kind="service", id="service", path="service.md",
-            body=_md_service(f), derived_from=provenance,
-        )
-
     def extract_capabilities(self, repo: Path) -> Node:
         caps = _extract_capabilities(repo)
         f = _service_facts(repo)
@@ -862,6 +984,23 @@ class MicronautGroovyAdapter:
 
     def capability_summary(self, repo: Path) -> dict:
         return capability_summary(repo)
+
+    def extract_evidence(self, repo: Path) -> Evidence:
+        return build_evidence(repo)
+
+    def extract_overview(self, repo: Path) -> Node:
+        facts = _service_facts(repo)
+        wiring = _wiring(repo)
+        risks = _risk_notes(repo)
+        hashes = build_evidence(repo).hashes()
+        provenance = sorted({c.file for c in _all_controllers(repo)}
+                            | {s.file for s in _parse_services(repo)}
+                            | {p for p in ["README.md", "build.gradle"] if (repo / p).exists()})
+        return Node(
+            level=Level.L1, kind="overview", id="overview", path="overview.md",
+            body=_md_overview(repo, facts, wiring, risks, hashes),
+            derived_from=provenance, supports_authored=True,
+        )
 
     def extract_modules(self, repo: Path) -> list[Node]:
         controllers = _all_controllers(repo)
@@ -880,88 +1019,9 @@ class MicronautGroovyAdapter:
                  derived_from=sorted({t.file for t in domain})),
         ]
 
-    def extract_conventions(self, repo: Path) -> Node:
-        build = _read(repo, "build.gradle") or ""
-        gradle_props = _read(repo, "gradle.properties") or ""
-        plugins = []
-        for m in re.finditer(r'id\s*\(?\s*["\']([\w.]+)["\'](?:\s*\)?\s*version\s+["\']([\w.]+)["\'])?', build):
-            plugins.append((m.group(1), m.group(2)))
-        test_runtime_m = re.search(r'testRuntime\(\s*["\'](\w+)["\']', build)
-        mn_ver_m = re.search(r"micronautVersion\s*=\s*(\S+)", gradle_props)
-        acceptance = "com.trevorism.gradle.acceptance" in build
-        shadow = "com.gradleup.shadow" in build or "shadow" in build
-
-        mn_plugin_ver = _micronaut_plugin_version(build)
-        lines = ["# Conventions (L3)", "", "## Build", ""]
-        if mn_ver_m:
-            lines.append(f"- **Micronaut (BOM):** {mn_ver_m.group(1)}")
-        if mn_plugin_ver:
-            line = f"- **Micronaut (application plugin):** {mn_plugin_ver}"
-            if mn_ver_m and mn_ver_m.group(1) != mn_plugin_ver:
-                line += f"  ⚠ drift: does not match BOM `{mn_ver_m.group(1)}`"
-            lines.append(line)
-        if plugins:
-            lines.append("- **Gradle plugins:** " + ", ".join(
-                f"`{p}`" + (f" {v}" if v else "") for p, v in plugins))
-        if shadow:
-            lines.append("- **Packaging:** shadow fat-jar (`<name>-all.jar`)")
-        lines += ["", "## Testing", ""]
-        lines.append(f"- **Unit test runtime:** {test_runtime_m.group(1) if test_runtime_m else 'unknown'} "
-                     "(JUnit5 + Groovy; duck-typed collaborators, no Spock/Mockito)")
-        if acceptance:
-            lines.append("- **Acceptance:** cucumber-groovy via `com.trevorism.gradle.acceptance`; "
-                         "glue under `src/acceptance/groovy/com/trevorism/gcloud/`")
-        lines += ["", "## Naming", "",
-                  "- Controllers: `<Name>Controller`",
-                  "- Services: interface `<Name>Service` + impl `Default<Name>Service`",
-                  "- Persistence: `FastDatastoreRepository<Model>` (no local repository layer)",
-                  ""]
-        provenance = [p for p in ["build.gradle", "gradle.properties"] if (repo / p).exists()]
-        return Node(Level.L3, "convention", "conventions", "conventions.md",
-                    "\n".join(lines), derived_from=provenance)
-
     def platform_signal_specs(self) -> list:
         return PLATFORM_SIGNAL_SPECS
 
     def platform_signals(self, repo: Path) -> dict:
         return _platform_signals(repo)
 
-    def extract_invariants(self, repo: Path) -> Node:
-        # Platform-governed facts are shown as *this repo's values*, pointing at the L0
-        # platform model for the norm + outliers; only genuinely per-repo facts are L4.
-        sig = _platform_signals(repo)
-        secrets = (repo / "src/main/resources/secrets.properties").exists()
-        unsecured: list[tuple[str, str]] = []
-        for ctrl in _all_controllers(repo):
-            for ep in ctrl.endpoints:
-                if not ep.secured:
-                    unsecured.append((f"{ep.http} {ep.route}", ctrl.name))
-
-        kind = classify(repo)
-        lines = ["# Invariants (L4)", "",
-                 "## Platform-governed", ""]
-        if kind in aggregate_kinds():
-            lines += ["Governed by the platform model (at the standalone model root); the norm and "
-                      "outliers live there. This repo's values:", ""]
-            for spec in PLATFORM_SIGNAL_SPECS:
-                lines.append(f"- **{spec.label}:** {_fmt_signal(spec, sig.get(spec.key))}")
-        else:
-            lines.append(f"Not applicable — this repo is classified `{kind}`, and platform "
-                         "invariants apply to services.")
-
-        lines += ["", "## Repo-specific", ""]
-        if unsecured:
-            lines.append("Deliberately unsecured endpoints (verify each is intended):")
-            lines.append("")
-            for route, cname in unsecured:
-                lines.append(f"- `{route}` — {cname}")
-            lines.append("")
-        lines.append(f"- `secrets.properties` committed under `src/main/resources`: "
-                     f"{'present' if secrets else 'absent'}"
-                     + (" — should not be committed (verify .gitignore)" if secrets else ""))
-        lines.append("")
-        provenance = [p for p in ["build.gradle", "src/main/appengine/app.yaml",
-                                  "src/main/resources/application.yml", "gradle.properties",
-                                  ".github/workflows/deploy.yml"] if (repo / p).exists()]
-        return Node(Level.L4, "invariant", "invariants", "invariants.md",
-                    "\n".join(lines), derived_from=provenance)
