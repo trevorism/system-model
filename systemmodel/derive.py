@@ -202,18 +202,23 @@ def _derive_platform(args, generated_at: str) -> int:
         try:
             kind = classify(repo)
             census.setdefault(kind, []).append(repo.name)
+            # Exposure is scanned across every repo, not just services: an unauthenticated write
+            # in a tester or an experiment is still an unauthenticated write, and scoping the
+            # security list to one repo kind hides whole classes of repo from it.
+            get_caps = getattr(adapter, "capability_summary", None)
+            if callable(get_caps):
+                summary = get_caps(repo)
+                if summary is not None:
+                    summary["kind"] = kind
+                    cap_summaries.append((repo.name, summary))
             if kind not in agg_kinds:
                 continue  # not a service — excluded from invariant/convention aggregation
             sigs = get_sigs(repo)
             repo_specs = get_specs()
-            get_caps = getattr(adapter, "capability_summary", None)
-            cap_sum = get_caps(repo) if callable(get_caps) else None
         except Exception as e:  # one bad repo shouldn't sink the aggregation
             print(f"  {repo.name}: ERROR {type(e).__name__}: {e}", file=sys.stderr)
             continue
         records.append((repo.name, sigs))
-        if cap_sum is not None:
-            cap_summaries.append((repo.name, cap_sum))
         for s in repo_specs:
             specs[s.key] = s
         adapters_used.add(adapter.name)

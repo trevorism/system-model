@@ -57,6 +57,16 @@ def test_acknowledging_one_route_does_not_excuse_another_in_the_same_repo():
     assert "POST /api/user" not in review
 
 
+def test_non_service_repos_are_scanned_and_labelled():
+    """Scoping the security list to services hid whole repo kinds from it."""
+    exposure = [("endpoint-tester", {"public_mutating": ["POST /api/json"], "kind": "tester"}),
+                ("event", {"public_mutating": ["POST /event/{topic}"], "kind": "service"})]
+    review = _platform_body(exposure, None).split("## Unauthenticated writes")[1]
+    assert "**endpoint-tester** _(tester)_" in review
+    assert "**event**: " in review
+    assert "_(service)_" not in review
+
+
 def test_no_acknowledgements_behaves_as_before():
     body = _platform_body(EXPOSURE, None)
     review = body.split("## Unauthenticated writes")[1]

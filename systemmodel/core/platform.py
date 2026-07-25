@@ -290,23 +290,26 @@ def render_platform(
                   "applies to every other service; each exemption is one repo, one signal, and "
                   "stands or falls on the reason given:", ""]
         index += [f"- {line}" for line in excused_lines]
-    unreviewed: list[tuple[str, list[str]]] = []
+    unreviewed: list[tuple[str, list[str], str]] = []
     reviewed: list[tuple[str, str, str]] = []
     for repo, summary in sorted(exposure or []):
         known = (acknowledged or {}).get(repo, {})
         fresh = [r for r in summary.get("public_mutating", []) if r not in known]
         if fresh:
-            unreviewed.append((repo, fresh))
+            unreviewed.append((repo, fresh, summary.get("kind", "")))
         reviewed += [(repo, route, known[route]) for route in summary.get("public_mutating", [])
                      if route in known]
 
     index += ["", "## Unauthenticated writes", ""]
     if unreviewed:
         index += ["Mutating endpoints with no `@Secure`, excluding routes that are public by "
-                  "design and those already reviewed. **Verify each is intended**, then record "
+                  "design and those already reviewed. Scanned across **every** repo, not only "
+                  "services — the repo kind is shown because it changes how much a finding "
+                  "matters, not whether it is reported. **Verify each is intended**, then record "
                   "it under `[[acknowledged_exposure]]` in `platform.toml`:", ""]
-        for repo, routes in unreviewed:
-            index.append(f"- **{repo}**: " + ", ".join(f"`{r}`" for r in routes))
+        for repo, routes, kind in unreviewed:
+            label = f"- **{repo}**" + (f" _({kind})_" if kind and kind != "service" else "")
+            index.append(f"{label}: " + ", ".join(f"`{r}`" for r in routes))
     else:
         index.append("None unreviewed — every unauthenticated write is either public by design "
                      "or recorded as reviewed below.")
