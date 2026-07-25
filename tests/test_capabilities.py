@@ -3,8 +3,9 @@ from pathlib import Path
 
 import pytest
 
+from systemmodel.core.adapter import extract_all
 from systemmodel.adapters.micronaut_groovy.extract import (
-    MicronautGroovyAdapter, _extract_capabilities, capability_summary,
+    MicronautGroovyAdapter, _all_controllers, _extract_capabilities, capability_summary,
 )
 
 CONTROLLER = """package com.trevorism.controller
@@ -94,10 +95,23 @@ def test_capability_summary(repo: Path):
     assert s["public_mutating"] == ["POST /widget"]
 
 
-def test_capabilities_node_supports_authored(repo: Path):
-    node = MicronautGroovyAdapter().extract_capabilities(repo)
-    assert node.supports_authored is True
-    assert node.path == "capabilities.md"
-    assert "<!-- intent:widget.create -->" in node.body
-    # content_hash is derived-body-only, so it is stable regardless of authored prose.
-    assert node.content_hash() == node.content_hash()
+def test_capabilities_doc_is_not_emitted(repo: Path):
+    paths = {n.path for n in extract_all(MicronautGroovyAdapter(), repo)}
+    assert "capabilities.md" not in paths
+    assert "modules/domain.md" not in paths
+    assert paths == {"overview.md", "modules/controllers.md", "modules/services.md"}
+
+
+def test_single_quoted_controller_prefix_is_parsed(tmp_path: Path):
+    """Groovy allows single quotes; reading only double-quoted strings collapsed routes to `/`."""
+    ctrl = tmp_path / "src/main/groovy/com/trevorism/controller"
+    ctrl.mkdir(parents=True)
+    (ctrl / "FolderController.groovy").write_text(
+        CONTROLLER.replace('@Controller("/widget")', "@Controller('/folder')")
+                  .replace('@Post("/")', "@Post('/')")
+                  .replace("WidgetController", "FolderController"),
+        encoding="utf-8",
+    )
+    routes = {e.route for c in _all_controllers(tmp_path) for e in c.endpoints}
+    assert "/folder" in routes
+    assert routes != {"/"}

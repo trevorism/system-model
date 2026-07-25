@@ -56,17 +56,22 @@ def _authored_body(node: Node, root: Path, synth_prose: dict[str, str] | None) -
     `body`/`content_hash` are unchanged — only the *written* file carries the prose.
     """
     body = node.body
-    dropped: list[str] = []
     prior = root / node.path
     if prior.is_file():
         _, authored = split_authored(prior.read_text(encoding="utf-8"))
         if authored:
-            current_ids = region_ids(node.body)
-            dropped = sorted(rid for rid in authored if rid not in current_ids)
-            body = merge_authored(body, authored)
+            # No empty intent slots are emitted — a placeholder nobody fills is just noise in
+            # every doc. So a preserved region usually has no anchor to merge into: re-attach
+            # it at the end rather than silently discarding someone's prose.
+            present = region_ids(node.body)
+            body = merge_authored(body, {k: v for k, v in authored.items() if k in present})
+            for rid, prose in sorted(authored.items()):
+                if rid not in present:
+                    body = (body.rstrip("\n")
+                            + f"\n\n<!-- intent:{rid} -->\n{prose}\n<!-- /intent -->\n")
     if synth_prose:
         body = merge_synth(body, synth_prose)
-    return body, dropped
+    return body, []
 
 
 def build_manifest(nodes: list[Node], *, adapter: str, target: str, generated_at: str) -> dict:

@@ -55,18 +55,19 @@ def test_prose_preserved_and_hash_stable(tmp_path: Path):
     assert second.dropped_authored == []
 
 
-def test_dropped_authored_reported_when_capability_removed(tmp_path: Path):
+def test_authored_prose_survives_when_its_anchor_disappears(tmp_path: Path):
+    """Human prose is never discarded: with no placeholder to merge into, it is re-attached."""
     _render(tmp_path, _node())
     doc = tmp_path / "capabilities.md"
     doc.write_text(
         doc.read_text(encoding="utf-8").replace(
             f"<!-- intent:topic.delete -->\n{PLACEHOLDER}\n<!-- /intent -->",
-            "<!-- intent:topic.delete -->\n> intent: soon to vanish.\n<!-- /intent -->",
+            "<!-- intent:topic.delete -->\n> intent: hard-won context.\n<!-- /intent -->",
         ),
         encoding="utf-8",
     )
 
-    # New derivation no longer produces the topic.delete capability.
+    # New derivation no longer produces the topic.delete anchor.
     shrunk = BODY[: BODY.index("#### As an admin")]
-    result = _render(tmp_path, _node(shrunk))
-    assert result.dropped_authored == ["capabilities.md:topic.delete"]
+    _render(tmp_path, _node(shrunk))
+    assert "> intent: hard-won context." in doc.read_text(encoding="utf-8")

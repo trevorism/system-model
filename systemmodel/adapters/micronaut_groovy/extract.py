@@ -53,7 +53,7 @@ def _rel(repo: Path, path: Path) -> str:
 
 
 def _first_string(text: str) -> str | None:
-    m = re.search(r'"([^"]*)"', text)
+    m = re.search(r"""["']([^"']*)["']""", text)
     return m.group(1) if m else None
 
 
@@ -160,12 +160,12 @@ def _parse_secure(argstr: str) -> tuple[str | None, str | None, bool]:
 def _annotation_value(argstr: str | None) -> str:
     if not argstr:
         return ""
-    m = re.search(r'value\s*=\s*"([^"]*)"', argstr)
+    m = re.search(r"""value\s*=\s*["']([^"']*)["']""", argstr)
     if m:
         return m.group(1)
     # Positional route only when the FIRST argument is a bare string literal
     # (`@Get("/x")`); a keyword arg like `produces = "application/json"` has no route.
-    m = re.match(r'\s*"([^"]*)"', argstr)
+    m = re.match(r"""\s*["']([^"']*)["']""", argstr)
     return m.group(1) if m else ""
 
 
@@ -606,43 +606,6 @@ def _extract_capabilities(repo: Path) -> list[Capability]:
     return caps
 
 
-def _md_capabilities(caps: list[Capability], f: dict) -> str:
-    lines = ["# Capabilities (L1)", "",
-             "What this service lets people and other services **do** — user stories synthesized "
-             "from its HTTP surface, security, and collaborators. The technical detail each story "
-             "rests on is in `modules/controllers.md`.", ""]
-    if f.get("purpose"):
-        lines += [f["purpose"], ""]
-
-    exposed = [c for c in caps if c.public_mutating]
-    if exposed:
-        lines += ["## Exposure", "",
-                  "Public **write** capabilities (no `@Secure`) — verify each is intended:", ""]
-        for c in exposed:
-            lines.append(f"- `{c.endpoint.http} {c.endpoint.route}` — {c.story.rstrip('.')} "
-                         f"(`{c.endpoint.handler}`)")
-        lines.append("")
-
-    lines += ["## Capabilities", ""]
-    if not caps:
-        lines += ["_No end-user capabilities derived (no annotated HTTP endpoints)._", ""]
-        return "\n".join(lines)
-
-    resource = None
-    for c in caps:
-        if c.resource != resource:
-            resource = c.resource
-            lines += [f"### {resource}", ""]
-        lines.append(f"#### {c.story} <!-- cap:{c.id} -->")
-        if c.summary:
-            lines.append(f"_{c.summary}_")
-        lines.append(f"↳ `{c.endpoint.http} {c.endpoint.route}` · `{c.endpoint.handler}`")
-        lines.append("")
-        # Authored overlay slot — human/agent intent preserved across re-derivation.
-        lines += [f"<!-- intent:{c.id} -->", "> intent: _(unspecified)_", "<!-- /intent -->", ""]
-    return "\n".join(lines)
-
-
 _TREVORISM_HOST = re.compile(r"https://([a-z0-9.-]+\.trevorism\.com)")
 _EVENT_TOPIC = re.compile(r"/event/([A-Za-z][A-Za-z0-9_-]*)")
 _SHARED_LIB = re.compile(r"com\.trevorism:([a-z0-9-]+)")
@@ -651,6 +614,8 @@ _PUBLIC_BY_DESIGN_SEGMENTS = {
     "login", "logout", "google", "microsoft", "oauth", "callback", "refresh",
     "forgot", "reset", "register", "token", "ping", "help", "version",
     "authwarmup", "warmup", "webhook", "swagger", "openapi",
+    # POST only because it takes a request body; returns a static capability listing.
+    "describe",
 }
 _PUBLIC_BY_DESIGN_HANDLERS = {
     "ping", "version", "help", "index", "root", "callback", "warmup", "authwarmup",
@@ -783,7 +748,7 @@ def _md_overview(repo: Path, f: dict, wiring: dict, risks: list[str], evidence_h
         lines += [f"- {note}" for note in risks]
     else:
         lines.append("_Nothing flagged: no unauthenticated writes outside auth flows._")
-    lines += ["", f"<!-- intent:{f['name']} -->", "> intent: _(unspecified)_", "<!-- /intent -->", ""]
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -846,44 +811,6 @@ def capability_summary(repo: Path) -> dict:
 
 # --------------------------------------------------------------------------------- render
 
-def _md_service(f: dict) -> str:
-    lines = [f"# {f['name']} — service (L1)", ""]
-    if f["purpose"]:
-        lines += [f"{f['purpose']}", ""]
-    lines += ["👉 **What it does for people:** see `capabilities.md` (the end-user view). This doc "
-              "is the service's identity and deployment facts.", ""]
-    lines += ["## Identity", ""]
-    lines += [f"- **App name:** `{f['name']}`"]
-    if f.get("kind"):
-        lines.append(f"- **Kind:** `{f['kind']}`")
-    if f["host"]:
-        lines.append(f"- **Deployed host:** {f['host']}")
-    if f["app_label"]:
-        if f["category"]:
-            lines.append(f"- **App / category:** `{f['app_label']}` / `{f['category']}`")
-        else:
-            lines.append(f"- **App:** `{f['app_label']}` _(bare host, no category)_")
-    if f["ping"]:
-        lines.append(f"- **Liveness:** `{f['ping']}` → `pong`")
-    if f["gcp_project"]:
-        lines.append(f"- **GCP project:** `{f['gcp_project']}`")
-    if f["runtime"]:
-        lines.append(f"- **Runtime:** `{f['runtime']}`" + (f" (JDK {f['jdk']})" if f["jdk"] else ""))
-    lines.append("")
-    # Technical footer: low-level release facts, demoted below identity. Version drift is a quiet
-    # footnote here, not the headline — the headline signal lives in capabilities.md (Exposure).
-    lines += ["## Technical facts", ""]
-    versions = f["versions"]
-    if versions:
-        version_str = ", ".join(f"`{ver}` ({src})" for src, ver in versions.items())
-        lines.append(f"- **Release version:** {version_str}")
-        if f["drift"]:
-            lines.append("  - _⚠ version drift: the sources above disagree; reconcile the lagging "
-                         "source to the intended release._")
-    lines.append("")
-    return "\n".join(lines)
-
-
 def _md_controllers(controllers: list[Controller]) -> str:
     lines = ["# Controllers (L2)", "", "HTTP surface derived from Micronaut annotations.", ""]
     lines += ["## Route table", "", "| Method | Route | Handler | Secured | Role | Permissions |",
@@ -927,21 +854,6 @@ def _md_services(services: list[Service]) -> str:
         collab = ", ".join(f"`{c}`" for c in s.collaborators) if s.collaborators else ""
         lines.append(f"| {iface} | {impl} | {singleton} | {collab} |")
     lines.append("")
-    return "\n".join(lines)
-
-
-def _md_domain(types: list[DomainType]) -> str:
-    lines = ["# Domain model (L2)", "", "Domain types (POGOs / enums).", ""]
-    for t in types:
-        lines.append(f"## {t.name} ({t.kind})")
-        if t.kind == "enum" and t.values:
-            lines.append("")
-            lines.append("Values: " + ", ".join(f"`{v}`" for v in t.values))
-        elif t.fields:
-            lines.append("")
-            for fld in t.fields:
-                lines.append(f"- `{fld}`")
-        lines.append("")
     return "\n".join(lines)
 
 
@@ -1025,15 +937,6 @@ class MicronautGroovyAdapter:
     def classify(self, repo: Path) -> str:
         return classify(repo)
 
-    def extract_capabilities(self, repo: Path) -> Node:
-        caps = _extract_capabilities(repo)
-        f = _service_facts(repo)
-        provenance = sorted({src for c in caps for src in c.source_files})
-        return Node(
-            level=Level.L1, kind="capabilities", id="capabilities", path="capabilities.md",
-            body=_md_capabilities(caps, f), derived_from=provenance, supports_authored=True,
-        )
-
     def capability_summary(self, repo: Path) -> dict:
         return capability_summary(repo)
 
@@ -1060,7 +963,6 @@ class MicronautGroovyAdapter:
     def extract_modules(self, repo: Path) -> list[Node]:
         controllers = _all_controllers(repo)
         services = _parse_services(repo)
-        domain = _parse_domain(repo)
         return [
             Node(Level.L2, "module", "controllers", "modules/controllers.md",
                  _md_controllers(controllers),
@@ -1069,9 +971,6 @@ class MicronautGroovyAdapter:
                  _md_services(services),
                  derived_from=sorted({_rel(repo, p) for p in iter_files(repo, "src/main")
                                       if _is_service_file(p)})),
-            Node(Level.L2, "module", "domain", "modules/domain.md",
-                 _md_domain(domain),
-                 derived_from=sorted({t.file for t in domain})),
         ]
 
     def platform_signal_specs(self) -> list:
