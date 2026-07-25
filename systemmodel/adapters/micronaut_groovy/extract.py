@@ -837,7 +837,9 @@ def capability_summary(repo: Path) -> dict:
         "category": _service_facts(repo).get("category"),
         "total": len(caps),
         "secured": sum(1 for c in caps if c.secured),
-        "public_mutating": [f"{c.endpoint.http} {c.endpoint.route}" for c in caps if c.public_mutating],
+        "public_mutating": [f"{c.endpoint.http} {c.endpoint.route}" for c in caps
+                            if c.public_mutating
+                            and not _is_public_by_design(c.endpoint.route, c.endpoint.handler)],
         "stories": [c.story for c in caps],
     }
 

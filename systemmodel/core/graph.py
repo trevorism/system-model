@@ -30,8 +30,25 @@ class ServiceGraph:
     def callees_of(self, repo_name: str) -> list[str]:
         return self.calls.get(repo_name, [])
 
-    def unresolved_hosts(self) -> set[str]:
-        return set()
+    def hubs(self, minimum: int = 2) -> list[tuple[str, int]]:
+        """Services many others depend on, most-depended-on first — the risky things to change."""
+        ranked = [(repo, len(callers)) for repo, callers in self.consumed_by.items()
+                  if len(callers) >= minimum]
+        return sorted(ranked, key=lambda rc: (-rc[1], rc[0]))
+
+    def leaves(self) -> list[str]:
+        """Services nothing else calls — safe to change, and candidates for retirement."""
+        known = set(self.calls) | set(self.consumed_by)
+        return sorted(r for r in known if not self.consumed_by.get(r))
+
+    def isolated(self) -> list[str]:
+        """Services with no edges in either direction."""
+        known = set(self.calls) | set(self.consumed_by)
+        return sorted(r for r in known
+                      if not self.consumed_by.get(r) and not self.calls.get(r))
+
+    def edge_count(self) -> int:
+        return sum(len(targets) for targets in self.calls.values())
 
 
 def normalize_host(host: str) -> str:

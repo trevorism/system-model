@@ -28,6 +28,7 @@ from systemmodel.core.adapter import extract_all
 from systemmodel.core.apply import build_brief, spec_gaps
 from systemmodel.core.auto import run_auto
 from systemmodel.core.config import aggregate_kinds, authored_signals
+from systemmodel.core.graph import service_graph
 from systemmodel.core.locate import dev_dir, model_root, platform_model_root, resolve_repo
 from systemmodel.core.platform import (
     aggregate, conformance, display_value as _disp, render_platform, render_platform_capabilities,
@@ -206,7 +207,8 @@ def _derive_platform(args, generated_at: str) -> int:
         print("run: uv run systemmodel --platform   (for the full report)")
         return 1
 
-    nodes = render_platform(aggs, census, agg_kinds, repos_used, adapters_used)
+    nodes = render_platform(aggs, census, agg_kinds, repos_used, adapters_used,
+                            graph=service_graph())
     if cap_summaries:
         nodes.append(render_platform_capabilities(cap_summaries))
     root = platform_model_root()

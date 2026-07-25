@@ -116,12 +116,10 @@ def _invariant_line(agg: Aggregate) -> str:
         if violators:
             line += "  ⚠ violations: " + ", ".join(violators)
         return line
-    non_holders = [r for r, v in agg.pairs if not v]
-    held = agg.total - len(non_holders)
-    line = f"- **{agg.spec.label}:** {held}/{agg.total} repos (observed, not required)"
-    if non_holders:
-        line += "  ⚠ outliers: " + ", ".join(non_holders)
-    return line
+    # No authored requirement means no one asked for this to hold, so naming "outliers" would be
+    # nagging about a spread nobody chose. Report the spread and stop.
+    held = agg.total - len([r for r, v in agg.pairs if not v])
+    return f"- **{agg.spec.label}:** {held}/{agg.total} repos (observed; not a requirement)"
 
 
 def _convention_line(agg: Aggregate) -> str:
@@ -141,14 +139,30 @@ def _convention_line(agg: Aggregate) -> str:
         if unset:
             line += "  · unset: " + ", ".join(unset)
         return line
-    line = f"- **{agg.spec.label}:** expected `{_disp(agg.expected)}` (observed norm) ({breakdown})"
-    deviating = [(r, v) for r, v in agg.pairs if v is not None and v != agg.expected]
-    unset = [r for r, v in agg.pairs if v is None]
-    if deviating:
-        line += "  ⚠ " + ", ".join(f"{r}=`{_disp(v)}`" for r, v in deviating)
-    if unset:
-        line += "  · unset: " + ", ".join(unset)
-    return line
+    return f"- **{agg.spec.label}:** {breakdown} (observed; not a requirement)"
+
+
+def _graph_section(graph, aggregated_repos: list[str]) -> list[str]:
+    """The lead read: what depends on what. Nothing else here is as expensive to work out."""
+    if graph is None:
+        return []
+    hubs = [(r, n) for r, n in graph.hubs() if r in set(aggregated_repos)]
+    lines = ["## Service graph", "",
+             "Who depends on whom, derived by matching each service's outbound hosts against the "
+             "hosts every other service answers on. This is the blast radius of a change.", "",
+             f"- **Edges:** {graph.edge_count()} across {len(graph.calls)} repos", ""]
+    if hubs:
+        lines += ["**Most depended on** — changing these is the expensive kind of change:", ""]
+        for repo, count in hubs[:8]:
+            callers = ", ".join(graph.callers_of(repo))
+            lines.append(f"- **{repo}** ← {count} consumers: {callers}")
+        lines.append("")
+    isolated = [r for r in graph.isolated() if r in set(aggregated_repos)]
+    if isolated:
+        lines += [f"**No edges either way** ({len(isolated)}): {', '.join(isolated)}", "",
+                  "Either genuinely standalone, or reached by a path this scan cannot see "
+                  "(a browser, a scheduled job, or CI rather than service code).", ""]
+    return lines
 
 
 def render_platform(
@@ -157,6 +171,7 @@ def render_platform(
     aggregated_kinds: list[str],
     aggregated_repos: list[str],
     adapters_used: set[str],
+    graph=None,
 ) -> list[Node]:
     """Render the aggregates + repo census into L0 platform Nodes.
 
@@ -174,14 +189,15 @@ def render_platform(
     index = [
         "# Platform model (L0)",
         "",
-        "System-wide invariants and conventions, derived by aggregating the code of every "
-        "repo in the platform. This is the platform peer of a repo's model — the "
-        "`~/.claude` to a repo's project config.",
+        "How the platform hangs together, derived from the code of every repo. This is the "
+        "platform peer of a repo's model — the `~/.claude` to a repo's project config.",
         "",
         f"- **Repos scanned:** {len(all_repos)}",
         f"- **Aggregated over:** {len(aggregated_repos)} repos of kind {', '.join(aggregated_kinds)}",
-        f"- **Adapters:** {', '.join(sorted(adapters_used)) or 'none'}",
         "",
+    ]
+    index += _graph_section(graph, aggregated_repos)
+    index += [
         "## Repo census",
         "",
         "Each repo's kind (service invariants apply only to services). Kinds are derived from "
@@ -208,36 +224,53 @@ def render_platform(
         index.append("")
         index.append("Each violation is a `derived ≠ authored` gap — fix the code, or change the "
                      "spec in `platform.toml`. See invariants.md / conventions.md for specifics.")
-    index += [
-        "",
-        "In invariants/conventions below, **REQUIRED** = authored intent (violations are drift); "
-        "otherwise the line is the observed norm, not a requirement.",
-        "",
-    ]
+    index += ["", "See `invariants.md` for the per-signal detail and `graph.md` for every edge.", ""]
     provenance = aggregated_repos
 
     inv_body = ["# Platform invariants (L0)", "",
                 "**REQUIRED** lines are authored intent — violations are drift. Other lines are the "
-                "observed norm across services, not a requirement.", ""]
+                "observed norm across services, not a requirement.", "",
+                "Dependency versions are deliberately absent: in a scale-to-zero estate they drift "
+                "as releases land, and the convention is to upgrade a repo when you are already in "
+                "it — so a version lag is surfaced in that repo's change brief, not held open here "
+                "as a standing platform violation.", ""]
     for a in invariants:
         inv_body.append(_invariant_line(a))
     inv_body.append("")
-
-    conv_body = ["# Platform conventions (L0)", "",
-                 "**REQUIRED** lines are authored intent — violations are drift. Other lines report "
-                 "the observed norm.", ""]
     for a in conventions:
-        conv_body.append(_convention_line(a))
-    conv_body.append("")
+        inv_body.append(_convention_line(a))
+    inv_body.append("")
 
-    return [
+    nodes = [
         Node(Level.L0, "platform", "platform", "platform.md",
              "\n".join(index), derived_from=all_repos),
         Node(Level.L0, "invariant", "platform-invariants", "invariants.md",
              "\n".join(inv_body), derived_from=provenance),
-        Node(Level.L0, "convention", "platform-conventions", "conventions.md",
-             "\n".join(conv_body), derived_from=provenance),
     ]
+    if graph is not None:
+        nodes.append(render_graph(graph, aggregated_repos))
+    return nodes
+
+
+def render_graph(graph, aggregated_repos: list[str]) -> Node:
+    """Every edge, both directions, so an agent can compute a blast radius without re-deriving."""
+    scope = sorted(set(aggregated_repos))
+    body = ["# Service graph (L0)", "",
+            "Every service-to-service edge on the platform. `calls` is derived from outbound "
+            "hostnames in a repo's own source; `consumed by` is that relation inverted.", "",
+            "Edges published from CI rather than service code (test-result events, deploy events) "
+            "are not shown — this reports what the code does, not what the pipeline does.", ""]
+    for repo in scope:
+        calls = graph.callees_of(repo)
+        callers = graph.callers_of(repo)
+        if not calls and not callers:
+            continue
+        body.append(f"### {repo}")
+        body.append(f"- calls → {', '.join(calls) if calls else '_(nothing)_'}")
+        body.append(f"- consumed by → {', '.join(callers) if callers else '_(nothing)_'}")
+        body.append("")
+    return Node(Level.L0, "graph", "platform-graph", "graph.md",
+                "\n".join(body), derived_from=scope)
 
 
 def render_platform_capabilities(summaries: list[tuple[str, dict]]) -> Node:
