@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from systemmodel.core.config import aggregate_kinds, repo_kind_override
+from systemmodel.core.config import acknowledged_exposure, aggregate_kinds, repo_kind_override
 from systemmodel.core.evidence import Evidence
 from systemmodel.core.filters import iter_files, read_text
 from systemmodel.core.graph import service_graph
@@ -774,20 +774,35 @@ def _wiring_with_consumers(repo: Path) -> dict:
     return wiring
 
 
+def _secrets_at_risk(repo: Path) -> bool:
+    """True only when the secrets file exists AND nothing ignores it.
+
+    Every service keeps a local `secrets.properties`, so flagging its mere presence fired on 41
+    of 41 repos and told the reader nothing. What matters is whether it would be committed —
+    checked against `.gitignore` rather than by shelling out to git, which keeps this module
+    text-only. Verified to agree with `git ls-files` across every repo that has the file.
+    """
+    if not (repo / "src/main/resources/secrets.properties").exists():
+        return False
+    ignore = _read(repo, ".gitignore") or ""
+    return "secrets.properties" not in ignore
+
+
 def _risk_notes(repo: Path) -> list[str]:
     notes: list[str] = []
-    exposed: list[tuple[str, str]] = []
+    reviewed = acknowledged_exposure().get(repo.name, {})
     for ctrl in _all_controllers(repo):
         for ep in ctrl.endpoints:
             if ep.secured or ep.http not in _MUTATING:
                 continue
-            if _is_public_by_design(ep.route, ep.handler):
+            route = f"{ep.http} {ep.route}"
+            if _is_public_by_design(ep.route, ep.handler) or route in reviewed:
                 continue
-            exposed.append((f"{ep.http} {ep.route}", ctrl.name))
-    for route, cname in exposed:
-        notes.append(f"`{route}` — unauthenticated write, and not an auth/session flow ({cname}).")
-    if (repo / "src/main/resources/secrets.properties").exists():
-        notes.append("`secrets.properties` present under `src/main/resources` — confirm it is gitignored.")
+            notes.append(f"`{route}` — unauthenticated write, and not an auth/session flow "
+                         f"({ctrl.name}).")
+    if _secrets_at_risk(repo):
+        notes.append("`secrets.properties` exists under `src/main/resources` and no `.gitignore` "
+                     "rule covers it — it will be committed.")
     return notes
 
 

@@ -80,6 +80,28 @@ def authored_exceptions() -> dict[str, dict[str, str]]:
     return by_signal
 
 
+def acknowledged_exposure() -> dict[str, dict[str, str]]:
+    """{repo: {route: reason}} for unauthenticated writes a human has reviewed and accepted.
+
+    A "verify each is intended" list with no way to record *verified* decays into a block of
+    text everyone skips — which is precisely when a genuinely new exposure slips through. An
+    acknowledged route drops out of the review position and is listed separately for audit, so
+    the section reports only what nobody has looked at yet.
+    """
+    entries = _load().get("acknowledged_exposure", [])
+    if not isinstance(entries, list):
+        return {}
+    by_repo: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        repo, route, reason = entry.get("repo"), entry.get("route"), entry.get("reason", "")
+        if not (isinstance(repo, str) and repo and isinstance(route, str) and route):
+            continue
+        by_repo.setdefault(repo, {})[route] = reason if isinstance(reason, str) else ""
+    return by_repo
+
+
 def authored_signals() -> dict[str, object]:
     """Prescriptive required/expected value per platform signal key.
 

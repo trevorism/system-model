@@ -227,6 +227,7 @@ def render_platform(
     adapters_used: set[str],
     graph=None,
     exposure: list[tuple[str, dict]] | None = None,
+    acknowledged: dict[str, dict[str, str]] | None = None,
 ) -> list[Node]:
     """Render the aggregates + repo census into L0 platform Nodes.
 
@@ -289,16 +290,32 @@ def render_platform(
                   "applies to every other service; each exemption is one repo, one signal, and "
                   "stands or falls on the reason given:", ""]
         index += [f"- {line}" for line in excused_lines]
-    exposed = [(r, s) for r, s in sorted(exposure or []) if s.get("public_mutating")]
+    unreviewed: list[tuple[str, list[str]]] = []
+    reviewed: list[tuple[str, str, str]] = []
+    for repo, summary in sorted(exposure or []):
+        known = (acknowledged or {}).get(repo, {})
+        fresh = [r for r in summary.get("public_mutating", []) if r not in known]
+        if fresh:
+            unreviewed.append((repo, fresh))
+        reviewed += [(repo, route, known[route]) for route in summary.get("public_mutating", [])
+                     if route in known]
+
     index += ["", "## Unauthenticated writes", ""]
-    if exposed:
+    if unreviewed:
         index += ["Mutating endpoints with no `@Secure`, excluding routes that are public by "
-                  "design (login, logout, OAuth callbacks, webhooks). Verify each is intended:", ""]
-        for repo, summary in exposed:
-            routes = ", ".join(f"`{r}`" for r in summary["public_mutating"])
-            index.append(f"- **{repo}**: {routes}")
+                  "design and those already reviewed. **Verify each is intended**, then record "
+                  "it under `[[acknowledged_exposure]]` in `platform.toml`:", ""]
+        for repo, routes in unreviewed:
+            index.append(f"- **{repo}**: " + ", ".join(f"`{r}`" for r in routes))
     else:
-        index.append("None — every mutating endpoint is either secured or public by design.")
+        index.append("None unreviewed — every unauthenticated write is either public by design "
+                     "or recorded as reviewed below.")
+    if reviewed:
+        index += ["", "### Reviewed and accepted", "",
+                  "Unauthenticated on purpose. Listed so the decision stays auditable; a new "
+                  "exposure appears above, alone, rather than buried in this list.", ""]
+        for repo, route, reason in reviewed:
+            index.append(f"- **{repo}** `{route}`" + (f" — {reason}" if reason else ""))
 
     index += ["", "See `invariants.md` for the per-signal detail and `graph.md` for every edge.", ""]
     provenance = aggregated_repos
