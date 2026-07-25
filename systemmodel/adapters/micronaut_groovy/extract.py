@@ -13,6 +13,7 @@ from pathlib import Path
 from systemmodel.core.config import aggregate_kinds, repo_kind_override
 from systemmodel.core.evidence import Evidence
 from systemmodel.core.filters import iter_files, read_text
+from systemmodel.core.graph import service_graph
 from systemmodel.core.overlay import synth_anchor
 from systemmodel.core.platform import SignalSpec
 from systemmodel.core.schema import Level, Node
@@ -665,8 +666,46 @@ def _is_public_by_design(route: str, handler: str) -> bool:
     return segments <= {"api"}
 
 
+def _host_aliases(repo: Path, facts: dict) -> list[str]:
+    """Every hostname this repo answers on.
+
+    The README's "Deployed to" line is the authoritative source when present, but most repos
+    lack it. The platform's addressing scheme is deterministic, so the rest is reconstructed
+    from the App Engine service name plus the GCP project: `<service>.<category>.trevorism.com`,
+    collapsing to `<category>.trevorism.com` for a project's default service. The bare
+    `<service>.trevorism.com` form is included too — callers use both.
+    """
+    aliases: list[str] = []
+    declared = facts.get("host")
+    if declared:
+        aliases.append(declared.split("://", 1)[-1].strip("/").lower())
+
+    project = (facts.get("gcp_project") or "").strip()
+    app_yaml = _read(repo, "src/main/appengine/app.yaml") or ""
+    m = re.search(r"(?m)^\s*service:\s*(\S+)", app_yaml)
+    service = (m.group(1).strip() if m else "default").strip("'\"")
+
+    if project == "trevorism":
+        aliases += ["trevorism.com", "www.trevorism.com"]
+    elif project.startswith("trevorism-"):
+        category = project[len("trevorism-"):]
+        if service and service != "default":
+            aliases.append(f"{service}.{category}.trevorism.com")
+            aliases.append(f"{service}.trevorism.com")
+        else:
+            aliases.append(f"{category}.trevorism.com")
+
+    seen: list[str] = []
+    for alias in aliases:
+        if alias and alias not in seen:
+            seen.append(alias)
+    return seen
+
+
 def _wiring(repo: Path) -> dict:
-    own_host = _service_facts(repo).get("host") or ""
+    facts = _service_facts(repo)
+    aliases = _host_aliases(repo, facts)
+    own_host = facts.get("host") or (f"https://{aliases[0]}" if aliases else "")
     hosts: set[str] = set()
     topics: set[str] = set()
     for path in iter_files(repo, "src/main"):
@@ -675,14 +714,23 @@ def _wiring(repo: Path) -> dict:
             continue
         hosts.update(_TREVORISM_HOST.findall(text))
         topics.update(_EVENT_TOPIC.findall(text))
-    hosts.discard(own_host.replace("https://", "").rstrip("/"))
+    for alias in aliases:
+        hosts.discard(alias)
     build = _read(repo, "build.gradle") or ""
     libs = {lib for lib in _SHARED_LIB.findall(build) if not lib.endswith("-plugin")}
     return {
+        "host": own_host,
+        "hosts": aliases,
         "calls": sorted(hosts),
         "publishes_topics": sorted(topics),
         "shared_libraries": sorted(libs),
     }
+
+
+def _wiring_with_consumers(repo: Path) -> dict:
+    wiring = dict(_wiring(repo))
+    wiring["consumed_by"] = service_graph().callers_of(repo.name)
+    return wiring
 
 
 def _risk_notes(repo: Path) -> list[str]:
@@ -722,6 +770,8 @@ def _md_overview(repo: Path, f: dict, wiring: dict, risks: list[str], evidence_h
     lines += ["## Wiring", ""]
     calls = " · ".join(wiring["calls"]) or "_(nothing outbound)_"
     lines.append(f"- **calls** → {calls}")
+    consumers = wiring.get("consumed_by") or []
+    lines.append(f"- **consumed by** → {', '.join(consumers) if consumers else '_(nothing calls this)_'}")
     if wiring["publishes_topics"]:
         lines.append(f"- **publishes** → {' · '.join(wiring['publishes_topics'])}")
     if wiring["shared_libraries"]:
@@ -743,7 +793,7 @@ def build_evidence(repo: Path) -> Evidence:
     services = _parse_services(repo)
     domain = _parse_domain(repo)
     caps = _extract_capabilities(repo)
-    wiring = _wiring(repo)
+    wiring = _wiring_with_consumers(repo)
 
     shared = {
         "name": facts.get("name"),
@@ -988,9 +1038,12 @@ class MicronautGroovyAdapter:
     def extract_evidence(self, repo: Path) -> Evidence:
         return build_evidence(repo)
 
+    def wiring(self, repo: Path) -> dict:
+        return _wiring(repo)
+
     def extract_overview(self, repo: Path) -> Node:
         facts = _service_facts(repo)
-        wiring = _wiring(repo)
+        wiring = _wiring_with_consumers(repo)
         risks = _risk_notes(repo)
         hashes = build_evidence(repo).hashes()
         provenance = sorted({c.file for c in _all_controllers(repo)}
