@@ -44,12 +44,17 @@ class Node:
     body: str
     derived_from: list[str] = field(default_factory=list)
     status: str = "derived"  # future: authored | mixed
+    supports_authored: bool = False  # doc interleaves preserved authored regions with `body`
 
     def content_hash(self) -> str:
         """Stable hash of the semantic content (body only, not the volatile frontmatter).
 
         Excluding generated_at/timestamps here is what makes re-runs diff-stable and gives
         later phases a cheap change-stream: the hash only moves when the code-derived facts do.
+
+        `body` is always the *derived* content the adapter produced. For a `supports_authored`
+        node the on-disk file additionally carries preserved authored regions (see
+        core/overlay), but those never enter the hash — so a prose-only edit is not drift.
         """
         return hashlib.sha256(self.body.encode("utf-8")).hexdigest()[:16]
 

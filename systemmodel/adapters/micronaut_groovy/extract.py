@@ -118,6 +118,8 @@ class Endpoint:
     permissions: str | None = None
     allow_internal: bool = False
     secured: bool = False
+    summary: str | None = None  # @Operation(summary=...) — human description, if present
+    tag: str | None = None      # @Tag(name=...) — grouping, if present
 
 
 @dataclass
@@ -185,6 +187,8 @@ def _parse_controller(repo: Path, path: Path) -> Controller | None:
     pending_http: tuple[str, str] | None = None
     pending_secure: tuple[str | None, str | None, bool] | None = None
     class_secure: tuple[str | None, str | None, bool] | None = None
+    pending_summary: str | None = None
+    pending_tag: str | None = None
     seen_class = False
     prev_inject = False
 
@@ -204,6 +208,16 @@ def _parse_controller(repo: Path, path: Path) -> Controller | None:
                 pending_secure = _parse_secure(s)
             else:
                 class_secure = _parse_secure(s)
+            continue
+        if s.startswith("@Operation"):
+            m = re.search(r'summary\s*=\s*"([^"]*)"', s)
+            if m:
+                pending_summary = m.group(1)
+            continue
+        if s.startswith("@Tag"):
+            m = re.search(r'name\s*=\s*"([^"]*)"', s)
+            if m:
+                pending_tag = m.group(1)
             continue
         http_m = HTTP_ANNOTATION.match(s)
         if http_m:
@@ -231,10 +245,14 @@ def _parse_controller(repo: Path, path: Path) -> Controller | None:
                         permissions=perms,
                         allow_internal=allow,
                         secured=effective is not None,
+                        summary=pending_summary,
+                        tag=pending_tag,
                     )
                 )
                 pending_http = None
                 pending_secure = None
+                pending_summary = None
+                pending_tag = None
     return ctrl
 
 
@@ -457,12 +475,191 @@ def _service_facts(repo: Path) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- capabilities
+
+# The end-user altitude: what people and other services can *do* with this service, synthesized
+# deterministically from the HTTP surface (route + verb), the security matrix (actor), and the
+# collaborators of the services each controller injects (outcome). Diff-stable like every other
+# derived doc; a human/agent can add narrative intent in the authored overlay (see core/overlay).
+
+_ROLE_ACTOR = {
+    "user": "an authenticated app",
+    "admin": "an admin",
+    "system": "a system caller",
+    "internal": "an internal caller",
+    "tenant_admin": "a tenant admin",
+}
+_ACTION = {
+    "GET": "view", "POST": "create", "PUT": "update", "PATCH": "update",
+    "DELETE": "remove", "HEAD": "check", "OPTIONS": "inspect",
+}
+_MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+# Endpoints that are infrastructure, not user capabilities.
+_INFRA_HANDLERS = {"ping", "version", "help", "index"}
+
+
+@dataclass
+class Capability:
+    id: str
+    resource: str
+    story: str
+    summary: str | None
+    endpoint: Endpoint
+    actor: str
+    secured: bool
+    mutating: bool
+    source_files: list[str] = field(default_factory=list)
+
+    @property
+    def public_mutating(self) -> bool:
+        return self.mutating and not self.secured
+
+
+def _article(word: str) -> str:
+    return "an" if word[:1].lower() in "aeiou" else "a"
+
+
+def _actor(ep: Endpoint) -> str:
+    if not ep.secured:
+        return "anyone (public)"
+    return _ROLE_ACTOR.get(ep.role or "", "an authenticated caller")
+
+
+def _resource_of(prefix: str, route: str) -> str:
+    """The resource a route acts on: the controller prefix's first segment (else the route's)."""
+    for candidate in (prefix, route):
+        seg = (candidate or "").strip("/").split("/")
+        if seg and seg[0] and not seg[0].startswith("{"):
+            return seg[0]
+    return "root"
+
+
+def _outcome(collaborators: list[str]) -> str:
+    """Map a controller's downstream collaborator *fields* to a human outcome clause.
+
+    Deliberately conservative: only signals that reliably mean an observable side effect count.
+    A persistence collaborator ⇒ "stored"; an event-channel collaborator ⇒ "published as an
+    event". We do NOT infer from a service's *class name* (e.g. `PubSub*` names the transport a
+    service is built on, not that each operation emits an event) — that over-claims.
+    """
+    verbs: list[str] = []
+    joined = " ".join(collaborators)
+    if re.search(r"Repository|Datastore", joined):
+        verbs.append("stored")
+    if re.search(r"ChannelClient|EventProducer|EventPublisher", joined):
+        verbs.append("published as an event")
+    return (" and it is " + " and ".join(verbs)) if verbs else ""
+
+
+def _action_verb(ep: Endpoint, outcome: str) -> str:
+    if ep.http == "POST" and "published as an event" in outcome:
+        return "submit"
+    if ep.http == "GET" and re.search(r"all|list", ep.handler, re.IGNORECASE):
+        return "list"
+    return _ACTION.get(ep.http, ep.http.lower())
+
+
+def _service_index(services: list[Service]) -> dict[str, Service]:
+    """Index services by both their interface and implementation names, for dep resolution."""
+    index: dict[str, Service] = {}
+    for svc in services:
+        for key in (svc.interface, svc.impl):
+            if key:
+                index[key] = svc
+    return index
+
+
+def _extract_capabilities(repo: Path) -> list[Capability]:
+    controllers = _all_controllers(repo)
+    services = _parse_services(repo)
+    index = _service_index(services)
+    caps: list[Capability] = []
+    for ctrl in controllers:
+        deps = [t for t, _ in ctrl.injects] + ctrl.constructor_params
+        collaborators: list[str] = []
+        dep_files: list[str] = []
+        for dep in deps:
+            svc = index.get(dep)
+            if svc:
+                collaborators += svc.collaborators
+                dep_files.append(svc.file)
+        outcome = _outcome(collaborators)
+        for ep in ctrl.endpoints:
+            handler = ep.handler
+            resource = _resource_of(ctrl.prefix, ep.route)
+            if handler in _INFRA_HANDLERS or ep.route in ("/", "/ping", "/version", "/help"):
+                continue
+            actor = _actor(ep)
+            verb = _action_verb(ep, outcome)
+            obj = f"{_article(resource)} {resource}"
+            story = f"As {actor}, I can {verb} {obj}{outcome}."
+            caps.append(Capability(
+                id=f"{resource}.{handler}", resource=resource, story=story,
+                summary=ep.summary, endpoint=ep, actor=actor, secured=ep.secured,
+                mutating=ep.http in _MUTATING,
+                source_files=sorted({ctrl.file, *dep_files}),
+            ))
+    caps.sort(key=lambda c: (c.resource, c.id))
+    return caps
+
+
+def _md_capabilities(caps: list[Capability], f: dict) -> str:
+    lines = ["# Capabilities (L1)", "",
+             "What this service lets people and other services **do** — user stories synthesized "
+             "from its HTTP surface, security, and collaborators. The technical detail each story "
+             "rests on is in `modules/controllers.md`.", ""]
+    if f.get("purpose"):
+        lines += [f["purpose"], ""]
+
+    exposed = [c for c in caps if c.public_mutating]
+    if exposed:
+        lines += ["## Exposure", "",
+                  "Public **write** capabilities (no `@Secure`) — verify each is intended:", ""]
+        for c in exposed:
+            lines.append(f"- `{c.endpoint.http} {c.endpoint.route}` — {c.story.rstrip('.')} "
+                         f"(`{c.endpoint.handler}`)")
+        lines.append("")
+
+    lines += ["## Capabilities", ""]
+    if not caps:
+        lines += ["_No end-user capabilities derived (no annotated HTTP endpoints)._", ""]
+        return "\n".join(lines)
+
+    resource = None
+    for c in caps:
+        if c.resource != resource:
+            resource = c.resource
+            lines += [f"### {resource}", ""]
+        lines.append(f"#### {c.story} <!-- cap:{c.id} -->")
+        if c.summary:
+            lines.append(f"_{c.summary}_")
+        lines.append(f"↳ `{c.endpoint.http} {c.endpoint.route}` · `{c.endpoint.handler}`")
+        lines.append("")
+        # Authored overlay slot — human/agent intent preserved across re-derivation.
+        lines += [f"<!-- intent:{c.id} -->", "> intent: _(unspecified)_", "<!-- /intent -->", ""]
+    return "\n".join(lines)
+
+
+def capability_summary(repo: Path) -> dict:
+    """Per-repo capability roll-up for the L0 platform capability map."""
+    caps = _extract_capabilities(repo)
+    return {
+        "category": _service_facts(repo).get("category"),
+        "total": len(caps),
+        "secured": sum(1 for c in caps if c.secured),
+        "public_mutating": [f"{c.endpoint.http} {c.endpoint.route}" for c in caps if c.public_mutating],
+        "stories": [c.story for c in caps],
+    }
+
+
 # --------------------------------------------------------------------------------- render
 
 def _md_service(f: dict) -> str:
     lines = [f"# {f['name']} — service (L1)", ""]
     if f["purpose"]:
         lines += [f"{f['purpose']}", ""]
+    lines += ["👉 **What it does for people:** see `capabilities.md` (the end-user view). This doc "
+              "is the service's identity and deployment facts.", ""]
     lines += ["## Identity", ""]
     lines += [f"- **App name:** `{f['name']}`"]
     if f.get("kind"):
@@ -481,15 +678,16 @@ def _md_service(f: dict) -> str:
     if f["runtime"]:
         lines.append(f"- **Runtime:** `{f['runtime']}`" + (f" (JDK {f['jdk']})" if f["jdk"] else ""))
     lines.append("")
-    lines += ["## Version", ""]
-    for src, ver in f["versions"].items():
-        lines.append(f"- `{ver}` — {src}")
-    if f["drift"]:
-        lines += [
-            "",
-            "> ⚠️ **Version drift:** the sources above disagree. Code is truth; reconcile the "
-            "lagging source(s) to the intended release.",
-        ]
+    # Technical footer: low-level release facts, demoted below identity. Version drift is a quiet
+    # footnote here, not the headline — the headline signal lives in capabilities.md (Exposure).
+    lines += ["## Technical facts", ""]
+    versions = f["versions"]
+    if versions:
+        version_str = ", ".join(f"`{ver}` ({src})" for src, ver in versions.items())
+        lines.append(f"- **Release version:** {version_str}")
+        if f["drift"]:
+            lines.append("  - _⚠ version drift: the sources above disagree; reconcile the lagging "
+                         "source to the intended release._")
     lines.append("")
     return "\n".join(lines)
 
@@ -652,6 +850,18 @@ class MicronautGroovyAdapter:
             level=Level.L1, kind="service", id="service", path="service.md",
             body=_md_service(f), derived_from=provenance,
         )
+
+    def extract_capabilities(self, repo: Path) -> Node:
+        caps = _extract_capabilities(repo)
+        f = _service_facts(repo)
+        provenance = sorted({src for c in caps for src in c.source_files})
+        return Node(
+            level=Level.L1, kind="capabilities", id="capabilities", path="capabilities.md",
+            body=_md_capabilities(caps, f), derived_from=provenance, supports_authored=True,
+        )
+
+    def capability_summary(self, repo: Path) -> dict:
+        return capability_summary(repo)
 
     def extract_modules(self, repo: Path) -> list[Node]:
         controllers = _all_controllers(repo)

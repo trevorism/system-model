@@ -238,3 +238,51 @@ def render_platform(
         Node(Level.L0, "convention", "platform-conventions", "conventions.md",
              "\n".join(conv_body), derived_from=provenance),
     ]
+
+
+def render_platform_capabilities(summaries: list[tuple[str, dict]]) -> Node:
+    """Aggregate per-service capability summaries into the L0 capability map.
+
+    `summaries` is (repo_name, summary) where summary = {category, total, secured,
+    public_mutating: [route...], ...} from an adapter's `capability_summary`. The doc leads with
+    the platform-wide exposure list (services with public write capabilities — the headline
+    "verify this" signal, lifted one altitude) then a category-grouped "what the platform can do".
+    """
+    summaries = sorted(summaries, key=lambda rs: rs[0])
+    total_caps = sum(s.get("total", 0) for _, s in summaries)
+    with_caps = [(r, s) for r, s in summaries if s.get("total", 0)]
+
+    body = ["# Platform capabilities (L0)", "",
+            "What the platform lets people and other services **do**, aggregated from every "
+            "service's `capabilities.md`. Each service's stories and authored intent live in its "
+            "own model; this is the cross-repo roll-up.", "",
+            f"- **Services with capabilities:** {len(with_caps)}",
+            f"- **Total capabilities:** {total_caps}", ""]
+
+    exposed = [(r, s) for r, s in summaries if s.get("public_mutating")]
+    body += ["## Exposure across the platform", ""]
+    if exposed:
+        body += ["Services exposing **public write** capabilities (no `@Secure`) — verify each is "
+                 "intended:", ""]
+        for repo, s in exposed:
+            routes = ", ".join(f"`{r}`" for r in s["public_mutating"])
+            body.append(f"- **{repo}**: {routes}")
+    else:
+        body.append("No public write capabilities across the platform.")
+    body.append("")
+
+    body += ["## Capability map", "", "What each service can do, grouped by category.", ""]
+    by_category: dict[str, list[tuple[str, dict]]] = {}
+    for repo, s in with_caps:
+        by_category.setdefault(s.get("category") or "uncategorized", []).append((repo, s))
+    for category in sorted(by_category):
+        body += [f"### {category}", ""]
+        for repo, s in sorted(by_category[category]):
+            public = len(s.get("public_mutating", []))
+            extra = f", {public} public write" if public else ""
+            noun = "capability" if s["total"] == 1 else "capabilities"
+            body.append(f"- **{repo}** — {s['total']} {noun}{extra}")
+        body.append("")
+
+    return Node(Level.L0, "capabilities", "platform-capabilities", "capabilities.md",
+                "\n".join(body), derived_from=[r for r, _ in summaries])

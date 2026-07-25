@@ -18,10 +18,12 @@ each repo's model lives in a **flat subdirectory named after the repo**:
 $SYSTEMMODEL_DIR/            # e.g. C:/systemmodel
   platform.toml             # authored policy (see below)
   platform.md               # L0 platform model
+  capabilities.md           # L0 cross-repo capability map
   invariants.md
   conventions.md
   MANIFEST.json             # platform manifest
   <repo>/                   # one subdir per repo
+    capabilities.md         # end-user view (lead read) — see below
     service.md
     modules/…
     conventions.md
@@ -80,11 +82,56 @@ authored intent from `platform.toml` requirements (`--platform`) and from a repo
 - **Code is truth.** The *derived* model is a projection of what the code actually is.
 - **Spec is intent** (future). Authored specs are targets, not truth. The gap `derived ≠ authored`
   is the signal — a routed human decision: change the code, or change the spec.
-- **One hierarchy:** **L0 platform (cross-repo)** → **L1 service → L2 module → L3 convention →
-  L4 invariant**.
+- **One hierarchy:** **L0 platform (cross-repo)** → **L1 service / capabilities → L2 module →
+  L3 convention → L4 invariant**.
+- **Lead with what it does for people.** The low-level facts (versions, endpoints, env) are for
+  machines and are easy to read off the code directly; a version bump from `5.0.0` → `5.0.2` is not
+  a meaningful *suggestion*. The model instead leads with **capabilities** — end-user / user-story
+  statements synthesized from those facts — and demotes the technical detail to a footnote.
 - The model is a peer to the code, kept in a **standalone directory** (`$SYSTEMMODEL_DIR`, default
   `C:/systemmodel`) rather than embedded in each repo — one place to read the whole platform, and
   target repos stay pristine.
+
+## Capabilities: the end-user altitude
+
+`capabilities.md` is the **lead read** for a repo. It answers *what can a person or another service
+do here?* rather than *how is it built?* Each capability is a user story composed deterministically
+from facts the adapter already extracts:
+
+> **As {actor}, I can {action} {object}{outcome}.**
+
+- *actor* ← the security matrix (`@Secure` role → "an authenticated app"; no `@Secure` → "anyone (public)").
+- *action* ← the HTTP verb (GET → view/list, POST → create/submit, PUT → update, DELETE → remove).
+- *object* ← the resource the route acts on.
+- *outcome* ← the collaborators of the services a controller injects (a `Repository` → "and it is
+  stored"; an event-channel client → "and published as an event").
+
+The doc leads with an **Exposure** callout — *public write* capabilities (mutating endpoints with no
+`@Secure`) — which is the headline "verify this" signal, replacing the version-bump nag. Because it's
+derived from code, `capabilities.md` participates in `--check` / `--apply` / `--gate` like every other
+doc: edit a story (e.g. change an actor from public to authenticated) and `--apply` emits a change
+brief pointing at the exact controllers/services to edit.
+
+### Authored intent overlay
+
+Deterministic stories stay honest and diff-stable, but they read mechanically. So each capability
+carries an **authored overlay** — an invisible anchored region a human or agent fills with narrative
+intent that re-derivation *preserves*:
+
+```
+#### As an authenticated app, I can submit a test result and it is stored. <!-- cap:event.testResult.submit -->
+↳ `POST /event/testResult` · `submit`
+
+<!-- intent:event.testResult.submit -->
+> intent: the platform's test-history spine; every suite run lands here for fan-out.
+<!-- /intent -->
+```
+
+The intent prose is **not** code-reconcilable, so it's excluded from the content hash (a prose edit
+is never reported as drift by `--check`) and stripped from `--apply` diffs (it never appears as a
+phantom code gap). A `derive` recovers the prose from the prior file and re-injects it; if a
+capability disappears, its orphaned intent is dropped and reported. The `L0 capabilities.md` rolls
+these up across services into a cross-repo capability map plus a platform-wide exposure list.
 
 ## Two altitudes: platform vs repo
 
@@ -173,7 +220,8 @@ are never touched by another target's run.
 ## Output layout (`$SYSTEMMODEL_DIR/<repo>/`)
 
 ```
-service.md            # L1  service identity, version (+ drift), host, liveness
+capabilities.md       # L1  end-user view (lead read): user stories + exposure + authored intent
+service.md            # L1  service identity, host, liveness + demoted technical footer (version)
 modules/
   controllers.md      # L2  route table + security matrix + DI graph
   services.md         # L2  service registry (interface + Default<Name>), collaborators
@@ -198,9 +246,10 @@ systemmodel/
 ```
 
 The `Adapter` interface (`core/adapter.py`) is the extensibility seam: a new target system is a
-new adapter, never a fork. An adapter implements `detect()` plus `extract_service/modules/
-conventions/invariants`, returning pre-rendered Nodes; the core owns the frontmatter/manifest
-envelope.
+new adapter, never a fork. An adapter implements `detect()` plus `extract_service/capabilities/
+modules/conventions/invariants`, returning pre-rendered Nodes; the core owns the frontmatter/manifest
+envelope. A node can set `supports_authored=True` to opt into the authored overlay (`core/overlay.py`),
+which the render/apply core preserves and excludes from hashing/diffing.
 
 ## Roadmap (later phases)
 

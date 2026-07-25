@@ -14,6 +14,7 @@ import difflib
 from pathlib import Path
 
 from systemmodel.core.locate import model_root
+from systemmodel.core.overlay import split_authored
 from systemmodel.core.schema import Node
 
 
@@ -42,6 +43,11 @@ def spec_gaps(repo: Path, nodes: list[Node]) -> list[tuple[Node, list[str]]]:
             continue  # spec doesn't (yet) express this node — nothing to reconcile
         desired = _strip_frontmatter(on_disk.read_text(encoding="utf-8")).strip("\n")
         current = node.body.rstrip("\n")
+        if node.supports_authored:
+            # Authored intent prose is not code-reconcilable — reduce both sides to their
+            # derived skeleton so a prose edit never shows up as a spurious code gap.
+            desired = split_authored(desired)[0].rstrip("\n")
+            current = split_authored(current)[0].rstrip("\n")
         if desired == current:
             continue
         diff = difflib.unified_diff(

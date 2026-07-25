@@ -6,6 +6,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
+[dependency-groups]
+dev = ["pytest>=8"]
+
 [project.scripts]
 systemmodel = "systemmodel.derive:main"
 
