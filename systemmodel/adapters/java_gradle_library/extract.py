@@ -6,9 +6,11 @@ the platform's hidden edges live — `Repository`, `ChannelClient` and friends h
 URLs that the ~30 repos declaring them never mention. Until now the graph asserted those hops from
 a hand-written table with no way to check it against the libraries themselves.
 
-So the two facts worth deriving are the published API surface (the types services inject) and the
-hosts the library reaches on their behalf. Like the Micronaut adapter, extraction is regex/line
-based over source text.
+So what this derives is the wiring — the hosts the library reaches on its consumers' behalf, and
+who declares it. The published type surface is extracted too, but no longer rendered: `javap`
+answers "what methods does this have" better than a generated table can, whereas which
+requirements a change to a type reopens is a question only the model can answer. That extraction
+therefore feeds `anchor_facts()` instead. Like the Micronaut adapter, it is regex/line based.
 """
 from __future__ import annotations
 
@@ -18,9 +20,10 @@ from pathlib import Path
 
 from systemmodel.core.clientlibs import client_type_name, hosts_reached
 from systemmodel.core.config import repo_kind_override
-from systemmodel.core.evidence import Evidence
-from systemmodel.core.filters import iter_files, read_text
+from systemmodel.core.evidence import Evidence, stable_hash
+from systemmodel.core.filters import iter_files, read_text, significant_source
 from systemmodel.core.graph import service_graph
+from systemmodel.core.members import index_unique_members, member_spans
 from systemmodel.core.overlay import synth_anchor
 from systemmodel.core.schema import Level, Node
 
@@ -35,7 +38,6 @@ _TYPE_DECL = re.compile(
     r"(class|interface|enum|record)\s+(\w+)",
     re.MULTILINE,
 )
-_ACCESSOR = re.compile(r"^(get|set|is)([A-Z]\w*)\(")
 _IMPLEMENTS = re.compile(r"\bclass\s+\w+(?:<[^>]*>)?\s+(?:extends\s+[\w<>.,\s]+?\s+)?implements\s+([\w<>.,\s]+?)\s*\{")
 _EXTENDS = re.compile(r"\bclass\s+\w+(?:<[^>]*>)?\s+extends\s+([\w.]+)")
 _FIELD_DECL = re.compile(r"private\s+(?:(?:final|static|transient|volatile)\s+)*([\w<>.]+)\s+\w+")
@@ -77,24 +79,6 @@ class JavaType:
     extends: str | None = None
     methods: list[str] = field(default_factory=list)
     reaches: list[str] = field(default_factory=list)
-
-    @property
-    def supertypes(self) -> list[str]:
-        return ([self.extends] if self.extends else []) + self.implements
-
-    @property
-    def properties(self) -> list[str]:
-        names: list[str] = []
-        for signature in self.methods:
-            m = _ACCESSOR.match(signature)
-            if m and m.group(2) not in names:
-                names.append(m.group(2))
-        return [n[0].lower() + n[1:] for n in names]
-
-    @property
-    def is_data_type(self) -> bool:
-        """A carrier with nothing but accessors — its properties are the interesting part."""
-        return bool(self.methods) and all(_ACCESSOR.match(s) for s in self.methods)
 
 
 def _split_params(params: str) -> list[str]:
@@ -187,26 +171,6 @@ def _is_internal(t: JavaType) -> bool:
         return True
     tail = t.package.rsplit(".", 1)[-1]
     return tail in ("exception", "deserialize", "util") or t.name.endswith("Exception")
-
-
-def _own_operations(t: JavaType, by_name: dict[str, JavaType]) -> list[str]:
-    """Operations this type adds beyond the ones its supertypes already list.
-
-    `DefaultChannelClient` restating every `ChannelClient` method doubles the operations list and
-    tells the reader nothing the interface row did not; an implementation that adds something is
-    worth showing, but only for what it adds.
-    """
-    inherited: set[str] = set()
-    pending = list(t.supertypes)
-    seen: set[str] = set()
-    while pending:
-        name = pending.pop()
-        if name in seen or name not in by_name:
-            continue
-        seen.add(name)
-        inherited.update(by_name[name].methods)
-        pending.extend(by_name[name].supertypes)
-    return [m for m in t.methods if m not in inherited]
 
 
 # ------------------------------------------------------------------------------- wiring
@@ -310,67 +274,6 @@ def _risk_notes(wiring: dict, types: list[JavaType], consumers: list[str]) -> li
     return notes
 
 
-def _root_package(types: list[JavaType]) -> str:
-    packages = [t.package.split(".") for t in types if t.package]
-    if not packages:
-        return ""
-    common = packages[0]
-    for parts in packages[1:]:
-        common = [a for a, b in zip(common, parts) if a == b]
-    return ".".join(common)
-
-
-def _md_api(artifact: dict, types: list[JavaType]) -> str:
-    coordinate = f"{artifact['group']}:{artifact['name']}"
-    root = _root_package(types)
-    lines = ["# Published API (L2)", "",
-             f"The surface a consumer gets from `{coordinate}`. Types a service injects are the "
-             f"contract; support types are listed separately.", ""]
-    if root:
-        lines += [f"Packages are shown relative to `{root}`.", ""]
-
-    public = [t for t in types if not _is_internal(t)]
-    internal = [t for t in types if _is_internal(t)]
-    by_name = {t.name: t for t in types}
-
-    def relative(package: str) -> str:
-        if not root or package == root:
-            return "."
-        return package[len(root) + 1:] if package.startswith(root + ".") else package
-
-    lines += ["## Contract types", "",
-              "| Type | Package | Kind | Extends / implements | Reaches |",
-              "|---|---|---|---|---|"]
-    for t in public:
-        supertypes = ", ".join(f"`{s}`" for s in t.supertypes) or ""
-        reaches = ", ".join(f"`{h}`" for h in t.reaches) or ""
-        lines.append(f"| {t.name} | `{relative(t.package)}` | {t.kind} | {supertypes} | {reaches} |")
-    lines.append("")
-
-    operations = [(t, _own_operations(t, by_name)) for t in public if not t.is_data_type]
-    operations = [(t, own) for t, own in operations if own]
-    if operations:
-        lines += ["## Operations", ""]
-        for t, own in operations:
-            suffix = " _(beyond its supertypes)_" if t.supertypes and len(own) < len(t.methods) else ""
-            lines.append(f"- **{t.name}**{suffix}")
-            for signature in own:
-                lines.append(f"  - `{signature}`")
-        lines.append("")
-
-    carriers = [t for t in public if t.is_data_type]
-    if carriers:
-        lines += ["## Data types", ""]
-        for t in carriers:
-            lines.append(f"- **{t.name}** — {', '.join(t.properties)}")
-        lines.append("")
-
-    if internal:
-        lines += ["## Support types", "",
-                  ", ".join(f"`{t.name}`" for t in sorted(internal, key=lambda t: t.name)), ""]
-    return "\n".join(lines)
-
-
 # ----------------------------------------------------------------------------- evidence
 
 def build_evidence(repo: Path) -> Evidence:
@@ -421,6 +324,25 @@ def _readme_purpose(repo: Path) -> str | None:
         if s and not s.startswith(("#", "!", "[")):
             return s
     return None
+
+
+def _anchor_facts(repo: Path) -> dict[str, dict]:
+    """Index every published symbol to the facts a requirement anchored on it depends on."""
+    facts: dict[str, dict] = {}
+    for t in _parse_types(repo):
+        source = repo / t.file
+        text = read_text(source) if source.is_file() else ""
+        facts[t.name] = {
+            "kind": t.kind, "package": t.package, "extends": t.extends,
+            "implements": t.implements, "methods": t.methods, "reaches": t.reaches,
+            "body": stable_hash(significant_source(text)) if text else "",
+        }
+        for signature in t.methods:
+            facts[f"{t.name}.{signature.split('(', 1)[0]}"] = {"signature": signature}
+        for name, span in member_spans(text).items():
+            facts.setdefault(f"{t.name}.{name}", {})["body"] = stable_hash(span)
+    index_unique_members(facts)
+    return facts
 
 
 def _classify(repo: Path) -> str:
@@ -475,13 +397,8 @@ class JavaGradleLibraryAdapter:
             derived_from=provenance, supports_authored=True,
         )
 
-    def extract_modules(self, repo: Path) -> list[Node]:
-        types = _parse_types(repo)
-        return [
-            Node(Level.L2, "module", "api", "modules/api.md",
-                 _md_api(_artifact(repo), types),
-                 derived_from=sorted({t.file for t in types})),
-        ]
+    def anchor_facts(self, repo: Path) -> dict:
+        return _anchor_facts(repo)
 
     def platform_signal_specs(self) -> list:
         """Libraries are excluded from service invariants (see platform.toml aggregate_kinds)."""

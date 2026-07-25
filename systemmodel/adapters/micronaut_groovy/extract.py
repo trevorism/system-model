@@ -12,9 +12,10 @@ from pathlib import Path
 
 from systemmodel.core.clientlibs import client_type_name, hosts_reached
 from systemmodel.core.config import acknowledged_exposure, aggregate_kinds, repo_kind_override
-from systemmodel.core.evidence import Evidence
-from systemmodel.core.filters import iter_files, read_text
+from systemmodel.core.evidence import Evidence, stable_hash
+from systemmodel.core.filters import iter_files, read_text, significant_source
 from systemmodel.core.graph import service_graph
+from systemmodel.core.members import index_unique_members, member_spans
 from systemmodel.core.overlay import synth_anchor
 from systemmodel.core.platform import SignalSpec
 from systemmodel.core.schema import Level, Node
@@ -858,54 +859,6 @@ def capability_summary(repo: Path) -> dict:
     }
 
 
-# --------------------------------------------------------------------------------- render
-
-def _md_controllers(controllers: list[Controller]) -> str:
-    lines = ["# Controllers (L2)", "", "HTTP surface derived from Micronaut annotations.", ""]
-    lines += ["## Route table", "", "| Method | Route | Handler | Secured | Role | Permissions |",
-              "|---|---|---|---|---|---|"]
-    unsecured: list[tuple[str, str]] = []
-    for ctrl in controllers:
-        for ep in ctrl.endpoints:
-            sec = "yes" if ep.secured else "**no**"
-            role = ep.role or ""
-            perms = ep.permissions or ""
-            if ep.allow_internal:
-                perms = (perms + " +internal").strip()
-            lines.append(f"| {ep.http} | `{ep.route}` | {ctrl.name}.{ep.handler} | {sec} | {role} | {perms} |")
-            if not ep.secured:
-                unsecured.append((f"{ep.http} {ep.route}", ctrl.name))
-    lines.append("")
-    if unsecured:
-        lines += ["## Unsecured endpoints", "",
-                  "Deliberately public (no `@Secure`) — verify each is intended:", ""]
-        for route, cname in unsecured:
-            lines.append(f"- `{route}` — {cname}")
-        lines.append("")
-    lines += ["## Dependency injection", ""]
-    for ctrl in controllers:
-        deps = [t for t, _ in ctrl.injects] + ctrl.constructor_params
-        deps = [d for d in deps if d]
-        dep_str = ", ".join(f"`{d}`" for d in deps) if deps else "_none_"
-        lines.append(f"- **{ctrl.name}** (`@Controller(\"{ctrl.prefix}\")`) → {dep_str}")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def _md_services(services: list[Service]) -> str:
-    lines = ["# Services (L2)", "",
-             "Service registry — the `interface + Default<Name>` pattern.", "",
-             "| Interface | Implementation | Singleton | Collaborators |", "|---|---|---|---|"]
-    for s in services:
-        iface = s.interface or "—"
-        impl = s.impl or "—"
-        singleton = "yes" if s.singleton else ""
-        collab = ", ".join(f"`{c}`" for c in s.collaborators) if s.collaborators else ""
-        lines.append(f"| {iface} | {impl} | {singleton} | {collab} |")
-    lines.append("")
-    return "\n".join(lines)
-
-
 # ---------------------------------------------------------------------- platform signals
 
 def _platform_signals(repo: Path) -> dict:
@@ -943,12 +896,82 @@ def _platform_signals(repo: Path) -> dict:
     }
 
 
-def _fmt_signal(spec: SignalSpec, value) -> str:
-    if value is None:
-        return "—"
-    if spec.type == "bool":
-        return "yes" if value else "no"
-    return f"`{value}`"
+def _source_digest(repo: Path, rel: str) -> str:
+    """Hash of a source file's significant lines — what a type-grained anchor rests on."""
+    path = repo / rel
+    return stable_hash(significant_source(read_text(path))) if path.is_file() else ""
+
+
+def _member_digests(repo: Path, rel: str) -> dict[str, str]:
+    """Member name -> digest of that member's source, for member-grained anchors."""
+    path = repo / rel
+    if not path.is_file():
+        return {}
+    return {name: stable_hash(span) for name, span in member_spans(read_text(path)).items()}
+
+
+def _index_members(facts: dict[str, dict], owner: str, digests: dict[str, str]) -> None:
+    """Add `Owner.member` keys, merging into any precise facts already recorded for them."""
+    for name, digest in digests.items():
+        facts.setdefault(f"{owner}.{name}", {})["body"] = digest
+
+
+def _anchor_facts(repo: Path) -> dict[str, dict]:
+    """Index every symbol a requirement might anchor on, to the facts it depends on.
+
+    Keyed by both type name and `Type.member`, because anchors are written at whichever grain
+    reads best — `TimelineController.generate` for one endpoint's behaviour, `PubSubEventService`
+    for a whole collaborator.
+    """
+    facts: dict[str, dict] = {}
+    for ctrl in _all_controllers(repo):
+        facts[ctrl.name] = {
+            "prefix": ctrl.prefix,
+            "routes": sorted(f"{e.http} {e.route}" for e in ctrl.endpoints),
+            "injects": sorted([t for t, _ in ctrl.injects] + ctrl.constructor_params),
+            "body": _source_digest(repo, ctrl.file),
+        }
+        # Endpoint-grained anchors get precise facts and no body digest: an unrelated edit
+        # elsewhere in the same controller must not mark this one endpoint's obligation stale.
+        for ep in ctrl.endpoints:
+            facts[f"{ctrl.name}.{ep.handler}"] = {
+                "http": ep.http, "route": ep.route, "secured": ep.secured,
+                "role": ep.role, "permissions": ep.permissions,
+            }
+        _index_members(facts, ctrl.name, _member_digests(repo, ctrl.file))
+    for svc in _parse_services(repo):
+        digests = _member_digests(repo, svc.file)
+        for key in (svc.interface, svc.impl):
+            if key:
+                facts[key] = {"collaborators": svc.collaborators, "singleton": svc.singleton,
+                              "body": _source_digest(repo, svc.file)}
+                _index_members(facts, key, digests)
+    for domain_type in _parse_domain(repo):
+        facts[domain_type.name] = {"kind": domain_type.kind, "fields": domain_type.fields,
+                                   "values": domain_type.values}
+
+    # Everything else in src/main. The passes above only see types matching the controller,
+    # `interface + Default<X>` and `/model/` shapes; a repo built from plain beans matches none
+    # of them and would have an empty index, leaving every one of its requirements untrackable.
+    # Anchors are written against whatever the code actually calls things, so index that.
+    # `.java` too: a couple of Micronaut repos here are Java-sourced, and the passes above are
+    # all Groovy-shaped, so they would otherwise index nothing at all.
+    for path in iter_files(repo, "src/main"):
+        if path.suffix not in (".groovy", ".java"):
+            continue
+        text = read_text(path)
+        declared = CLASS_DECL.search(text) or IFACE_DECL.search(text)
+        if not declared:
+            continue
+        name = declared.group(1)
+        facts.setdefault(name, {}).setdefault(
+            "body", stable_hash(significant_source(text)))
+        for member, span in member_spans(text).items():
+            facts.setdefault(f"{name}.{member}", {}).setdefault("body", stable_hash(span))
+    index_unique_members(facts)
+    return facts
+
+
 
 
 def _classify(repo: Path) -> str:
@@ -1009,18 +1032,8 @@ class MicronautGroovyAdapter:
             derived_from=provenance, supports_authored=True,
         )
 
-    def extract_modules(self, repo: Path) -> list[Node]:
-        controllers = _all_controllers(repo)
-        services = _parse_services(repo)
-        return [
-            Node(Level.L2, "module", "controllers", "modules/controllers.md",
-                 _md_controllers(controllers),
-                 derived_from=sorted({c.file for c in controllers})),
-            Node(Level.L2, "module", "services", "modules/services.md",
-                 _md_services(services),
-                 derived_from=sorted({_rel(repo, p) for p in iter_files(repo, "src/main")
-                                      if _is_service_file(p)})),
-        ]
+    def anchor_facts(self, repo: Path) -> dict:
+        return _anchor_facts(repo)
 
     def platform_signal_specs(self) -> list:
         return PLATFORM_SIGNAL_SPECS

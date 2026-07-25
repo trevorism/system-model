@@ -5,8 +5,7 @@ import pytest
 
 import systemmodel.core.graph as graph
 from systemmodel.adapters.java_gradle_library.extract import (
-    JavaGradleLibraryAdapter, _md_api, _own_operations, _param_type, _parse_types,
-    _root_package, _split_params, _wiring,
+    JavaGradleLibraryAdapter, _is_internal, _param_type, _parse_types, _split_params, _wiring,
 )
 from systemmodel.core.clientlibs import hosts_hardcoded_by
 from systemmodel.core.locate import dev_dir
@@ -145,10 +144,8 @@ def test_wiring_reports_the_hardcoded_host_and_the_library_mediated_one(tmp_path
 def test_package_private_type_is_support_but_still_reports_its_host(tmp_path: Path):
     types = {t.name: t for t in _parse_types(_library_repo(tmp_path))}
     assert types["RequestUtils"].exported is False
+    assert _is_internal(types["RequestUtils"]) is True
     assert types["RequestUtils"].reaches == ["datastore.data.trevorism.com"]
-    body = _md_api({"group": "com.trevorism", "name": "datastore-client"},
-                   list(types.values()))
-    assert "`RequestUtils`" in body.split("## Support types")[1]
 
 
 def test_interface_methods_are_captured_without_a_public_modifier(tmp_path: Path):
@@ -158,20 +155,12 @@ def test_interface_methods_are_captured_without_a_public_modifier(tmp_path: Path
     ]
 
 
-def test_an_implementation_lists_only_what_it_adds(tmp_path: Path):
+def test_method_signatures_are_extracted_for_anchoring(tmp_path: Path):
     types = {t.name: t for t in _parse_types(_library_repo(tmp_path))}
-    own = _own_operations(types["FastDatastoreRepository"], types)
-    assert own == ["refresh(String, Map<String, String>) → void"]
-
-
-def test_an_accessor_only_type_is_rendered_as_data_not_operations(tmp_path: Path):
-    types = _parse_types(_library_repo(tmp_path))
-    subscription = next(t for t in types if t.name == "EventSubscription")
-    assert subscription.is_data_type is True
-    assert subscription.properties == ["name"]
-    body = _md_api({"group": "com.trevorism", "name": "datastore-client"}, types)
-    assert "- **EventSubscription** — name" in body
-    assert "getName()" not in body
+    assert "refresh(String, Map<String, String>) → void" in types["FastDatastoreRepository"].methods
+    assert types["Repository"].methods == [
+        "all() → List<T>", "get(String) → T", "create(T) → T",
+    ]
 
 
 def test_generic_parameters_are_not_split_on_their_inner_comma():
@@ -183,8 +172,15 @@ def test_generic_parameters_are_not_split_on_their_inner_comma():
     assert _param_type("@Nullable String id") == "String"
 
 
-def test_root_package_is_the_common_prefix(tmp_path: Path):
-    assert _root_package(_parse_types(_library_repo(tmp_path))) == "com.trevorism.data"
+def test_the_adapter_publishes_an_anchor_index_over_types_and_members(tmp_path: Path):
+    index = JavaGradleLibraryAdapter().anchor_facts(_library_repo(tmp_path))
+    assert "Repository" in index
+    assert "FastDatastoreRepository.refresh" in index
+    assert index["RequestUtils"]["reaches"] == ["datastore.data.trevorism.com"]
+
+
+def test_the_adapter_renders_no_structural_documents(tmp_path: Path):
+    assert not hasattr(JavaGradleLibraryAdapter(), "extract_modules")
 
 
 class _Stub:

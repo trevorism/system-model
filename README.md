@@ -17,17 +17,13 @@ each repo's model lives in a **flat subdirectory named after the repo**:
 ```
 $SYSTEMMODEL_DIR/            # e.g. C:/systemmodel
   platform.toml             # authored policy (see below)
-  platform.md               # L0 platform model
-  capabilities.md           # L0 cross-repo capability map
-  invariants.md
-  conventions.md
+  platform.md               # L0 platform model: graph, census, conformance, exposure
+  graph.md                  # L0 every service-to-service edge, both directions
+  invariants.md             # L0 authored requirements vs the observed norm
+  platform.toml             # authored policy (hand-written; never generated)
   MANIFEST.json             # platform manifest
   <repo>/                   # one subdir per repo
-    capabilities.md         # end-user view (lead read) — see below
-    service.md
-    modules/…
-    conventions.md
-    invariants.md
+    overview.md             # purpose, requirement records, wiring, risks
     MANIFEST.json
 ```
 
@@ -219,10 +215,10 @@ agent's edits stay isolated and revertable) and never commits; the agent runs wi
 by default, or `--dangerous` (`--dangerously-skip-permissions`) if it needs Bash/tests. Preview
 with `--dry-run` (prints the brief + the command, mutates nothing).
 
-Note: the `.md` files double as the spec format for now, so a hand-edit must be internally consistent
-— e.g. securing an endpoint means updating both the route table *and* the "unsecured endpoints"
-section it feeds. A more formal spec format (tighter targets, machine-checkable acceptance) is on the
-roadmap.
+Note: this path still diffs whole documents, which works for structure and not for intent. Editing
+a requirement is the direction being built toward — one obligation in one place, with acceptance by
+verification rather than by text match. Until Phase 5 of that work lands, `--apply`/`--auto` remain
+document-diff based.
 
 ## How it stays honest
 
@@ -240,16 +236,53 @@ are never touched by another target's run.
 ## Output layout (`$SYSTEMMODEL_DIR/<repo>/`)
 
 ```
-capabilities.md       # L1  end-user view (lead read): user stories + exposure + authored intent
-service.md            # L1  service identity, host, liveness + demoted technical footer (version)
-modules/
-  controllers.md      # L2  route table + security matrix + DI graph
-  services.md         # L2  service registry (interface + Default<Name>), collaborators
-  domain.md           # L2  domain types / enums + fields
-conventions.md        # L3  build/test/naming conventions
-invariants.md         # L4  coverage gate, security, transport, unsecured endpoints
+overview.md           # L1  identity, synthesized purpose, requirement records, wiring, risks
+features/<slug>.md    # L2  one capability, with its finer-grained requirements
 MANIFEST.json         # machine index: nodes, provenance (derived_from), content hashes
 ```
+
+One document, because the model earns its keep only where it says something the code doesn't.
+Route tables, DI lists and published type surfaces were ~44% of the output and every line of them
+was greppable; they are extracted still, but as `anchor_facts()` rather than prose — see
+*Requirements* below.
+
+### Requirement records
+
+`overview.md` carries the obligations the repo must meet, one block each:
+
+```markdown
+<!-- req:R3 origin=authored anchors=4a1c2f09 state=verified -->
+**R3.** Mutating endpoints require a signed app token, so a caller cannot reach data its own
+credentials do not permit.
+→ `TimelineController.generate`, `SecureHttpClient`
+<!-- /req -->
+```
+
+Nothing in the header is hand-typed. You edit the prose and flip `origin=derived` to `authored`;
+the tool owns `anchors` and `state`. `derived` records are description and are regenerated
+whenever synthesis re-runs; `authored` records are binding intent and survive untouched, keeping
+their IDs forever so a verdict can cite `R3` across runs.
+
+`anchors` is a hash of the *extracted facts* the requirement's `→` symbols resolve to — member
+-grained where a member is named, type-grained otherwise. When it moves, the requirement is
+**stale**: the code beneath the obligation changed and whether it still holds is an open question.
+Hashing facts rather than bytes is deliberate — a reformatted comment must not reopen an
+obligation, or the signal becomes noise and stops being read.
+
+### Features
+
+`features/<slug>.md` is the bottom of the hierarchy and still semantic: a capability with intent
+("test-result fan-out"), never a class or a controller. Each holds the finer-grained obligations
+that would bury the ≤7 headline requirements if they all lived in the overview.
+
+The decomposition is **one agent call per repo**, not one per feature — the agent has to read the
+whole repo to cut it sensibly either way — and it only fires when the repo's evidence hash moves.
+
+Slugs are **sticky**. Decomposition is non-deterministic, so a naive re-run would re-cut and
+rename features every pass and the tree would churn beyond recognition. A slug on disk is never
+renamed or deleted: if a later decomposition stops proposing it, the document stays and is marked
+so a human decides. That also keeps `--check` honest — the node set is read from disk, so a check
+and a write never disagree about which documents should exist.
 
 Each doc has YAML frontmatter (`level`, `kind`, `id`, `adapter`, `status`, `derived_from`,
 `generator_version`, `generated_at`). `content_hash` in `MANIFEST.json` hashes body only, so

@@ -95,11 +95,16 @@ def test_capability_summary(repo: Path):
     assert s["public_mutating"] == ["POST /widget"]
 
 
-def test_capabilities_doc_is_not_emitted(repo: Path):
+def test_only_the_semantic_document_is_emitted(repo: Path):
+    """Structural docs restate what a reader can grep; the extraction now feeds anchors instead."""
     paths = {n.path for n in extract_all(MicronautGroovyAdapter(), repo)}
-    assert "capabilities.md" not in paths
-    assert "modules/domain.md" not in paths
-    assert paths == {"overview.md", "modules/controllers.md", "modules/services.md"}
+    assert paths == {"overview.md"}
+
+
+def test_the_extraction_behind_the_removed_docs_still_feeds_the_anchor_index(repo: Path):
+    index = MicronautGroovyAdapter().anchor_facts(repo)
+    assert "WidgetController" in index
+    assert any(key.startswith("WidgetController.") for key in index)
 
 
 def test_single_quoted_controller_prefix_is_parsed(tmp_path: Path):

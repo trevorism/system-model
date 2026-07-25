@@ -38,7 +38,23 @@ class Adapter(Protocol):
         ...
 
     def extract_modules(self, repo: Path) -> list[Node]:
-        """L2: modules (controllers, services, domain, ...)."""
+        """L2: optional structural documents.
+
+        Both current adapters decline this. Rendering the route table, the DI list and the type
+        surface cost ~44% of the model to say what a reader could grep in seconds, and the same
+        extraction is worth far more under `anchor_facts()`, where it decides which requirements
+        a code change reopens. Kept on the interface for an adapter whose target genuinely has
+        structure worth publishing.
+        """
+        ...
+
+    def anchor_facts(self, repo: Path) -> dict:
+        """Symbol name -> the extracted facts a requirement anchored on it depends on.
+
+        This is where structural extraction earns its keep once it stops being rendered: a
+        requirement's anchors resolve against this index, and the hash of what they resolve to
+        is what makes a semantic obligation drift-checkable. Empty if unsupported.
+        """
         ...
 
     def platform_signal_specs(self) -> list:
@@ -96,9 +112,10 @@ def extract_all(adapter: Adapter, repo: Path) -> list[Node]:
     predates a given layer still works.
     """
     nodes: list[Node] = []
-    for name in ("extract_overview", "extract_capabilities"):
+    for name in ("extract_overview", "extract_capabilities", "extract_modules"):
         extractor = getattr(adapter, name, None)
-        if callable(extractor):
-            nodes.append(extractor(repo))
-    nodes.extend(adapter.extract_modules(repo))
+        if not callable(extractor):
+            continue
+        produced = extractor(repo)
+        nodes.extend(produced if isinstance(produced, list) else [produced])
     return nodes

@@ -3,7 +3,9 @@ from pathlib import Path
 
 from systemmodel.core.apply import build_brief
 from systemmodel.core.platform import SignalSpec, aggregate, trailing_conventions
-from systemmodel.core.schema import Level, Node
+from systemmodel.core.requirements import (
+    AUTHORED, UNVERIFIED, VERIFIED, VIOLATED, Requirement, render,
+)
 
 SPECS = {
     "micronaut.version": SignalSpec("micronaut.version", "Micronaut version (BOM)",
@@ -58,16 +60,24 @@ def test_unknown_repo_yields_nothing():
     assert trailing_conventions("nonexistent", _aggs()) == []
 
 
-def _node_with_gap() -> Node:
-    return Node(Level.L1, "overview", "overview", "overview.md", body="# derived\n")
+def _model_with(tmp_path: Path, monkeypatch, requirement: Requirement | None) -> Path:
+    import systemmodel.core.apply as apply_mod
+    monkeypatch.setattr(apply_mod, "model_root", lambda repo: tmp_path)
+    body = render([requirement]) if requirement else "# overview\n"
+    (tmp_path / "overview.md").write_text(body, encoding="utf-8")
+    return tmp_path
+
+
+def _unmet() -> Requirement:
+    return Requirement(id="R1", body="Mutating endpoints require a signed token.",
+                       anchors=["TimelineController.generate"], origin=AUTHORED, state=VIOLATED,
+                       finding="No @Secure on the handler.")
 
 
 def test_advisories_are_appended_but_excluded_from_acceptance(tmp_path: Path, monkeypatch):
-    import systemmodel.core.apply as apply_mod
-    monkeypatch.setattr(apply_mod, "model_root", lambda repo: tmp_path)
-    (tmp_path / "overview.md").write_text("# desired\n", encoding="utf-8")
+    repo = _model_with(tmp_path, monkeypatch, _unmet())
 
-    brief = build_brief(tmp_path, [_node_with_gap()],
+    brief = build_brief(repo,
                         advisories=["**Micronaut version (BOM):** `5.0.2` — most are on `5.0.5`"])
 
     assert "While you're here" in brief
@@ -77,19 +87,19 @@ def test_advisories_are_appended_but_excluded_from_acceptance(tmp_path: Path, mo
 
 
 def test_no_advisories_means_no_section(tmp_path: Path, monkeypatch):
-    import systemmodel.core.apply as apply_mod
-    monkeypatch.setattr(apply_mod, "model_root", lambda repo: tmp_path)
-    (tmp_path / "overview.md").write_text("# desired\n", encoding="utf-8")
-
-    brief = build_brief(tmp_path, [_node_with_gap()])
+    brief = build_brief(_model_with(tmp_path, monkeypatch, _unmet()))
     assert "While you're here" not in brief
 
 
 def test_advisories_never_manufacture_a_brief(tmp_path: Path, monkeypatch):
-    """A repo that matches its spec gets no brief, however far its versions trail."""
-    import systemmodel.core.apply as apply_mod
-    monkeypatch.setattr(apply_mod, "model_root", lambda repo: tmp_path)
-    node = _node_with_gap()
-    (tmp_path / "overview.md").write_text(node.body, encoding="utf-8")
+    """A repo meeting every authored requirement gets no brief, however far its versions trail."""
+    verified = Requirement(id="R1", body="Held.", origin=AUTHORED, state=VERIFIED)
+    repo = _model_with(tmp_path, monkeypatch, verified)
 
-    assert build_brief(tmp_path, [node], advisories=["**Anything:** `x` — most are on `y`"]) is None
+    assert build_brief(repo, advisories=["**Anything:** `x` — most are on `y`"]) is None
+
+
+def test_a_repo_with_no_authored_intent_gets_no_brief(tmp_path: Path, monkeypatch):
+    """Derived description is not a promise, so it can never be a gap to close."""
+    described = Requirement(id="R1", body="Just a description.", state=UNVERIFIED)
+    assert build_brief(_model_with(tmp_path, monkeypatch, described)) is None

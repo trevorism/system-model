@@ -59,3 +59,23 @@ def iter_files(repo: Path, subdir: str | None = None) -> Iterator[Path]:
 def read_text(path: Path) -> str:
     """Read a text file tolerantly (source may contain odd bytes)."""
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def significant_source(text: str) -> str:
+    """Source reduced to the lines that carry meaning, for change detection.
+
+    Requirements anchored on a whole type need to notice a change *inside* it, which the
+    structural facts alone are too coarse to see — a constant can move without any route,
+    collaborator or signature changing. Hashing this instead of raw bytes keeps reformatting,
+    blank lines and comment edits from marking an obligation for re-review, which is what would
+    turn the staleness signal into noise.
+
+    Whole-line comments only: stripping `//` mid-line would mangle URLs in string literals.
+    """
+    kept: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("//", "*", "/*", "*/", "#")):
+            continue
+        kept.append(" ".join(line.split()))
+    return "\n".join(kept)

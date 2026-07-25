@@ -24,7 +24,7 @@ _AGENT_FOOTER = (
     "You are being run non-interactively to satisfy the change brief above. Edit ONLY this "
     "repo's code to close the gap. The system model is the spec, not the target — it lives in a "
     "standalone directory outside this repo, so do not attempt to edit it. Acceptance is "
-    "`uv run systemmodel {repo} --check` reporting clean (re-derivation reproduces the spec)."
+    "`uv run systemmodel {repo} --verify` reporting every requirement satisfied."
 )
 
 
@@ -58,6 +58,31 @@ def _dirty_files(repo: Path) -> list[str] | None:
     return [line[3:] for line in proc.stdout.splitlines() if line.strip()]
 
 
+def _refresh(repo: Path, *, model: str | None, on_log) -> None:
+    """Re-derive then re-verify, so the next brief is built from a current verdict.
+
+    Imported here rather than at module scope: `derive` is the CLI that calls into this module,
+    so a top-level import would be circular.
+    """
+    from datetime import datetime
+
+    from systemmodel import derive as cli
+
+    class _Args:
+        adapter = None
+        dry_run = False
+        check = False
+        model = None
+
+    args = _Args()
+    args.model = model
+    try:
+        cli._process_repo(repo, args, datetime.now().isoformat(timespec="seconds"))
+        cli._verify_repo(repo, args)
+    except Exception as e:  # a refresh failure must not look like a satisfied requirement
+        on_log(f"warning: could not refresh {repo.name}: {type(e).__name__}: {e}")
+
+
 def run_auto(repo: Path, adapter: Adapter, *, max_iters: int = 3, dangerous: bool = False,
              model: str | None = None, dry_run: bool = False, on_log=print) -> int:
     """Drive an agent from the change brief until re-derivation is clean (or the cap is hit).
@@ -88,9 +113,9 @@ def run_auto(repo: Path, adapter: Adapter, *, max_iters: int = 3, dangerous: boo
                 on_log(f"  {f}")
             return 2
 
-    brief = build_brief(repo, extract_all(adapter, repo))
+    brief = build_brief(repo)
     if brief is None:
-        on_log(f"{repo.name}: code already matches the spec — nothing to apply.")
+        on_log(f"{repo.name}: every authored requirement is verified — nothing to apply.")
         return 0
 
     cmd = _claude_cmd(dangerous, model)
@@ -118,13 +143,17 @@ def run_auto(repo: Path, adapter: Adapter, *, max_iters: int = 3, dangerous: boo
                    f"Brief left at {out} for inspection.")
             return 1
 
-        # Acceptance: re-derive from the (now edited) code and see if the gap is closed.
-        brief = build_brief(repo, extract_all(adapter, repo))
+        # Acceptance is a fresh verdict on the edited code, not a text match. Re-derive first so
+        # anchor hashes are re-baselined and any verdict about code the agent just changed is
+        # dropped — otherwise the stale verdict would be mistaken for confirmation.
+        _refresh(repo, model=model, on_log=on_log)
+        brief = build_brief(repo)
         if brief is None:
             out.unlink(missing_ok=True)
-            on_log(f"\nclean — {repo.name} matches the spec after {i} iteration(s).")
+            on_log(f"\nclean — {repo.name} meets every authored requirement "
+                   f"after {i} iteration(s).")
             return 0
-        on_log(f"residual drift after iteration {i}; feeding the gap back.")
+        on_log(f"requirements still unmet after iteration {i}; feeding the gap back.")
 
     out.write_text(brief, encoding="utf-8", newline="\n")
     on_log(f"\nstill drifting after {max_iters} iteration(s); remaining gap left at {out}. "

@@ -7,6 +7,7 @@
     uv run systemmodel --platform          # L0 platform model -> $SYSTEMMODEL_DIR/ (root)
     uv run systemmodel <repo> --apply      # spec -> code: emit a change brief from the edited model
     uv run systemmodel <repo> --auto       # spec -> code: drive an agent from the brief, then verify
+    uv run systemmodel <repo> --verify     # ask an agent whether the code meets each authored requirement
     uv run systemmodel <repo> --gate       # conformance: exit 1 if code violates authored intent
     uv run systemmodel --all --gate        # conformance across all repos (CI gate)
     uv run systemmodel --platform --gate   # conformance: exit 1 if platform.toml requirements violated
@@ -20,13 +21,15 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 from systemmodel.core import adapter as adapters
 from systemmodel.core.adapter import extract_all
-from systemmodel.core.apply import build_brief, spec_gaps
+from systemmodel.core.apply import authored_requirements, build_brief, requirement_gaps
 from systemmodel.core.auto import run_auto
+from systemmodel.core import features
 from systemmodel.core.config import (
     acknowledged_exposure, aggregate_kinds, authored_exceptions, authored_signals,
 )
@@ -37,6 +40,12 @@ from systemmodel.core.platform import (
     trailing_conventions,
 )
 from systemmodel.core.render import read_manifest, render
+from systemmodel.core.requirements import (
+    UNANCHORED, VERIFIED, VIOLATED, Requirement, hash_for, parse_blocks, staleness,
+    update_in_text,
+)
+from systemmodel.core.synth import decompose as synth_decompose
+from systemmodel.core.synth import verify as synth_verify
 from systemmodel.core.synth import resolve as synth_resolve
 
 
@@ -65,13 +74,77 @@ def _drift(mroot: Path, new_manifest: dict, pruned: list[str]) -> list[str]:
     return lines
 
 
+def _anchor_index(adapter, repo: Path) -> dict:
+    """The adapter's symbol → facts index, or empty if it doesn't support one."""
+    get_facts = getattr(adapter, "anchor_facts", None)
+    if not callable(get_facts):
+        return {}
+    try:
+        return get_facts(repo)
+    except Exception:
+        return {}  # a broken index degrades staleness tracking; it shouldn't sink the derive
+
+
 def _synthesize(repo: Path, adapter, nodes: list, args) -> tuple[dict, list[str]]:
     """Resolve synthesized prose for a writing derive. Never called by --check/--gate/--dry-run,
     which reconcile the skeleton and so must stay free, offline and deterministic."""
     get_evidence = getattr(adapter, "extract_evidence", None)
     if not callable(get_evidence):
         return {}, []
-    return synth_resolve(repo, nodes, get_evidence(repo), model=args.model)
+    return synth_resolve(repo, nodes, get_evidence(repo), model=args.model,
+                         anchor_index=_anchor_index(adapter, repo))
+
+
+def _requirement_findings(repo: Path, adapter) -> tuple[list[str], int]:
+    """(stale requirement lines, unanchored count) for the model on disk.
+
+    Free and offline: it compares the anchor hash each requirement recorded against the one its
+    anchors resolve to now. Once the structural docs stop being rendered this is the *only* thing
+    that notices a code change, so it is what `--check` reports instead of a file-level hash.
+    """
+    root = model_root(repo)
+    if not root.exists():
+        return [], 0
+    index = _anchor_index(adapter, repo)
+    if not index:
+        return [], 0
+    stale_lines: list[str] = []
+    unanchored = 0
+    for path in sorted(root.rglob("*.md")):
+        found = parse_blocks(path.read_text(encoding="utf-8"))
+        if not found:
+            continue
+        rel = path.relative_to(root).as_posix()
+        for requirement, reason in staleness(found, index):
+            if reason == UNANCHORED:
+                unanchored += 1
+            else:
+                stale_lines.append(f"{rel}:{requirement.id} stale (anchored code changed)")
+    return stale_lines, unanchored
+
+
+def _feature_layer(repo: Path, adapter, args, writing: bool) -> tuple[list, dict, list[str]]:
+    """Feature nodes and their prose.
+
+    When writing, the decomposition is resolved (one agent call, only if the code moved). When
+    not, the node set is rebuilt from the documents already on disk — so `--check` and a write
+    always agree on which files should exist, and a check never reports a feature as missing
+    just because it did not run synthesis.
+    """
+    index = _anchor_index(adapter, repo)
+    if not writing:
+        existing = features.load(model_root(repo))
+        ordered = [existing[slug] for slug in sorted(existing)]
+        return features.nodes(ordered, index), {}, []
+
+    get_evidence = getattr(adapter, "extract_evidence", None)
+    if not callable(get_evidence):
+        return [], {}, []
+    resolved, stamp, regenerated = synth_decompose(
+        repo, get_evidence(repo), index, model=args.model)
+    return (features.nodes(resolved, index),
+            features.prose(resolved, stamp),
+            ["features"] if regenerated else [])
 
 
 def _process_repo(repo: Path, args, generated_at: str) -> tuple[str, list[str], str]:
@@ -81,12 +154,23 @@ def _process_repo(repo: Path, args, generated_at: str) -> tuple[str, list[str], 
     mroot = model_root(repo)
     writing = not (args.dry_run or args.check)
     prose, regenerated = _synthesize(repo, adapter, nodes, args) if writing else ({}, [])
+    feature_nodes, feature_prose, feature_regen = _feature_layer(repo, adapter, args, writing)
+    nodes = nodes + feature_nodes
+    prose = {**prose, **feature_prose}
+    regenerated = regenerated + feature_regen
     # --check never writes; it renders in dry-run to compute the new manifest + stale files.
     result = render(mroot, nodes, adapter=adapter.name, target=repo.name,
                     generated_at=generated_at, dry_run=not writing, synth_prose=prose)
     if args.check:
         drift = _drift(mroot, result.manifest, result.pruned)
-        return ("drift" if drift else "clean", drift, adapter.name)
+        stale, unanchored = _requirement_findings(repo, adapter)
+        detail = drift + stale
+        if unanchored:
+            detail.append(f"{unanchored} requirement(s) anchor nothing resolvable "
+                          f"(not tracked; not a failure)")
+        # Unanchored requirements are a coverage gap to improve, not a change to react to, so
+        # they are reported without failing the check.
+        return ("drift" if (drift or stale) else "clean", detail, adapter.name)
     detail = [f"[{n.level.value}] {n.path} ({n.content_hash()})" for n in nodes]
     if regenerated:
         detail.append(f"re-synthesized: {', '.join(regenerated)}")
@@ -106,13 +190,77 @@ def _candidate_repos() -> list[Path]:
 
 
 def _gate_repo(repo: Path, args) -> list[str]:
-    """Per-repo conformance: the model doc paths whose code diverges from the edited spec.
+    """Per-repo conformance: authored requirements the code does not meet.
 
-    Empty means the repo conforms (no on-disk spec, or code matches it). Raises LookupError if
-    no adapter matches the repo (caller decides whether to skip or fail).
+    Empty means the repo conforms (nothing authored, or every obligation verified). Raises
+    LookupError if no adapter matches, so the caller can decide between skipping and failing.
     """
-    adapter = adapters.select(repo, args.adapter)
-    return [n.path for n, _ in spec_gaps(repo, extract_all(adapter, repo))]
+    adapters.select(repo, args.adapter)  # keep the "no adapter" contract for the batch caller
+    return [f"{requirement.id} ({path})" for path, requirement in requirement_gaps(repo)]
+
+
+def _verification_targets(repo: Path, adapter) -> list[tuple[str, Requirement]]:
+    """Authored requirements whose verdict is missing, negative, or no longer current.
+
+    A violated record is re-checked rather than trusted: after an agent edits the code the whole
+    point is to ask again. A verified one is re-checked when its anchors have moved, so a verdict
+    never outlives the code it was made about.
+    """
+    index = _anchor_index(adapter, repo)
+    targets: list[tuple[str, Requirement]] = []
+    for path, requirement in authored_requirements(repo):
+        moved = requirement.anchor_hash != hash_for(requirement, index)
+        if requirement.state != VERIFIED or moved:
+            targets.append((path, requirement))
+    return targets
+
+
+def _verify_repo(repo: Path, args) -> int:
+    """Check each authored requirement against the code and record the verdict."""
+    try:
+        adapter = adapters.select(repo, args.adapter)
+    except LookupError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    root = model_root(repo)
+    if not root.exists():
+        print(f"error: no model at {root}; run `uv run systemmodel {repo.name}` first",
+              file=sys.stderr)
+        return 2
+
+    targets = _verification_targets(repo, adapter)
+    if not targets:
+        total = len(authored_requirements(repo))
+        print(f"{repo.name}: nothing to verify "
+              f"({total} authored requirement(s), all verified against current code)"
+              if total else
+              f"{repo.name}: no authored requirements yet — promote one with `origin=authored`")
+        return 0
+
+    updates: dict[str, list[Requirement]] = {}
+    violated = unclear = 0
+    for path, requirement in targets:
+        print(f"  verifying {path}:{requirement.id} …")
+        state, finding = synth_verify(repo, requirement, model=args.model)
+        if state is None:
+            unclear += 1
+            print(f"    unclear — leaving {requirement.id} as {requirement.state}"
+                  + (f": {finding}" if finding else ""))
+            continue
+        if state == VIOLATED:
+            violated += 1
+        print(f"    {state}" + (f" — {finding}" if finding else ""))
+        updates.setdefault(path, []).append(
+            replace(requirement, state=state, finding=finding))
+
+    for path, requirements in updates.items():
+        target = root / path
+        target.write_text(update_in_text(target.read_text(encoding="utf-8"), requirements),
+                          encoding="utf-8", newline="\n")
+
+    checked = sum(len(v) for v in updates.values())
+    print(f"\n{repo.name}: {checked} verified, {violated} violated, {unclear} unclear")
+    return 1 if violated else 0
 
 
 def _platform_aggregates(args) -> dict:
@@ -153,26 +301,22 @@ def _advisories(repo: Path, args) -> list[str]:
 
 
 def _apply_repo(repo: Path, args) -> int:
-    """Spec -> change brief: diff the edited on-disk model against derived code, emit instructions."""
+    """Intent -> change brief: the authored requirements the code does not meet."""
     root = model_root(repo)
     if not root.exists():
         print(f"error: no model at {root}\n"
-              f"       run `uv run systemmodel {repo.name}` first, then edit the .md files and "
-              f"re-run --apply.", file=sys.stderr)
+              f"       run `uv run systemmodel {repo.name}` first, then promote a requirement to "
+              f"`origin=authored` and re-run --apply.", file=sys.stderr)
         return 2
     try:
-        adapter = adapters.select(repo, args.adapter)
-        nodes = extract_all(adapter, repo)  # current state, in memory — never overwrites the spec
+        adapters.select(repo, args.adapter)
     except LookupError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    except Exception as e:
-        print(f"error: failed to derive {repo.name}: {type(e).__name__}: {e}", file=sys.stderr)
-        return 2
 
-    brief = build_brief(repo, nodes, advisories=_advisories(repo, args))
+    brief = build_brief(repo, advisories=_advisories(repo, args))
     if brief is None:
-        print(f"{repo.name}: code already matches the spec — nothing to apply.")
+        print(f"{repo.name}: every authored requirement is verified — nothing to apply.")
         return 0
     out = root / "change-brief.md"
     out.write_text(brief, encoding="utf-8", newline="\n")
@@ -302,6 +446,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="print the plan without writing")
     parser.add_argument("--check", action="store_true",
                         help="report drift vs the checked-in model without writing; exit 1 if stale")
+    parser.add_argument("--verify", action="store_true",
+                        help="check each authored requirement against the code with an agent and "
+                             "record the verdict; exit 1 if any is violated")
     parser.add_argument("--gate", action="store_true",
                         help="conformance gate: exit 1 if code violates authored intent — a repo's "
                              "edited spec (repo/--all) or platform.toml requirements (--platform). "
@@ -342,6 +489,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--auto requires a repo name")
     if args.gate and args.check:
         parser.error("--check (staleness) and --gate (conformance) are separate checks; run each")
+    if args.verify and (args.all or args.platform):
+        parser.error("--verify works on a single repo (agent calls are per requirement)")
+    if args.verify and not args.repo:
+        parser.error("--verify requires a repo name")
+    if args.verify and (args.check or args.gate or args.apply or args.auto):
+        parser.error("--verify records verdicts; --check/--gate/--apply/--auto read them — run each")
     if args.gate and args.apply:
         parser.error("--apply emits the change brief; --gate checks the same gap with an exit code — use one")
     if args.gate and args.auto:
@@ -368,7 +521,7 @@ def main(argv: list[str] | None = None) -> int:
             checked += 1
             if paths:
                 violated += 1
-                print(f"  {repo.name:24} VIOLATION  differs from spec in {', '.join(paths)}")
+                print(f"  {repo.name:24} VIOLATION  unmet: {', '.join(paths)}")
             else:
                 print(f"  {repo.name:24} ok")
         print(f"\n{checked} checked, {skipped} skipped (no adapter), {errored} errored, "
@@ -411,6 +564,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: repo path does not exist: {repo}", file=sys.stderr)
         return 2
 
+    if args.verify:
+        return _verify_repo(repo, args)
+
     if args.gate:
         try:
             paths = _gate_repo(repo, args)
@@ -418,10 +574,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {e}", file=sys.stderr)
             return 2
         if paths:
-            print(f"VIOLATION - {repo.name}: code differs from spec in {', '.join(paths)}")
+            print(f"VIOLATION - {repo.name}: unmet authored requirement(s): {', '.join(paths)}")
             print(f"run: uv run systemmodel {repo.name} --apply   (for the change brief)")
             return 1
-        print(f"clean - {repo.name} code conforms to its spec")
+        print(f"clean - {repo.name} meets every authored requirement")
         return 0
 
     if args.apply:
