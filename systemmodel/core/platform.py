@@ -359,25 +359,35 @@ def _edge_label(graph, caller: str, target: str) -> str:
 
 def render_graph(graph, aggregated_repos: list[str]) -> Node:
     """Every edge, both directions, so an agent can compute a blast radius without re-deriving."""
-    scope = sorted(set(aggregated_repos))
+    # Scope is every repo with an edge, not just the aggregated services: a client library shows
+    # up as a consumer of the service it wraps, so it needs a section of its own or a reader who
+    # looks it up finds it named but not listed.
+    scope = sorted(set(aggregated_repos) | set(graph.calls) | set(graph.consumed_by))
     body = ["# Service graph (L0)", "",
             "Every service-to-service edge on the platform. `calls` is derived from outbound "
             "hostnames in a repo's own source plus the hosts its shared client libraries reach "
             "on its behalf; `consumed by` is that relation inverted.", "",
             "An edge tagged `via X` is library-mediated: the repo never names the host, it "
             "declares a collaborator of type `X` whose library hardcodes the URL. Untagged edges "
-            "are literal URLs in the repo's own source.", "",
+            "are literal URLs in the repo's own source. Shared client libraries have sections of "
+            "their own: they are not services, but they hold the URLs their consumers never name, "
+            "so the edge originates with them.", "",
             "Edges published from CI rather than service code (test-result events, deploy events) "
             "are not shown — this reports what the code does, not what the pipeline does.", ""]
     for repo in scope:
         calls = graph.callees_of(repo)
         callers = graph.callers_of(repo)
-        if not calls and not callers:
+        declarers = graph.library_consumers_of(repo)
+        if not calls and not callers and not declarers:
             continue
         labelled = ", ".join(_edge_label(graph, repo, target) for target in calls)
         body.append(f"### {repo}")
         body.append(f"- calls → {labelled or '_(nothing)_'}")
         body.append(f"- consumed by → {', '.join(callers) if callers else '_(nothing)_'}")
+        # A library is consumed by Gradle coordinate, never over HTTP, so the host-derived
+        # inversion above reports nothing for it. Reporting only that would read as "unused".
+        if declarers:
+            body.append(f"- declared as a dependency by → {', '.join(declarers)}")
         body.append("")
     return Node(Level.L0, "graph", "platform-graph", "graph.md",
                 "\n".join(body), derived_from=scope)

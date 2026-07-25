@@ -30,9 +30,19 @@ class ServiceGraph:
     calls: dict[str, list[str]]
     consumed_by: dict[str, list[str]]
     mediated_by: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+    library_consumed_by: dict[str, list[str]] = field(default_factory=dict)
 
     def callers_of(self, repo_name: str) -> list[str]:
         return self.consumed_by.get(repo_name, [])
+
+    def library_consumers_of(self, artifact: str) -> list[str]:
+        """Repos declaring a dependency on this artifact — the compile-time edge.
+
+        A shared library is consumed by Gradle coordinate, not over HTTP, so it never appears in
+        the host-derived edges. Without this a library looks like a leaf, which is the opposite
+        of true: it is the thing with the widest blast radius.
+        """
+        return self.library_consumed_by.get(artifact, [])
 
     def callees_of(self, repo_name: str) -> list[str]:
         return self.calls.get(repo_name, [])
@@ -69,6 +79,7 @@ def build(repos: list[Path]) -> ServiceGraph:
     claims: dict[str, set[str]] = {}
     outbound: dict[str, list[str]] = {}
     through_libraries: dict[str, dict[str, list[str]]] = {}
+    library_consumed_by: dict[str, list[str]] = {}
 
     for repo in repos:
         try:
@@ -87,6 +98,9 @@ def build(repos: list[Path]) -> ServiceGraph:
         outbound[repo.name] = [normalize_host(h) for h in info.get("calls", [])]
         through_libraries[repo.name] = {normalize_host(host): list(clients)
                                         for host, clients in (info.get("library_calls") or {}).items()}
+        for artifact in info.get("shared_libraries") or []:
+            if artifact != repo.name:
+                library_consumed_by.setdefault(artifact, []).append(repo.name)
 
     # An alias claimed by more than one repo cannot identify a target, so drop it rather
     # than attribute an edge to an arbitrary winner.
@@ -116,6 +130,7 @@ def build(repos: list[Path]) -> ServiceGraph:
         calls=calls,
         consumed_by={k: sorted(v) for k, v in consumed_by.items()},
         mediated_by=mediated_by,
+        library_consumed_by={k: sorted(set(v)) for k, v in sorted(library_consumed_by.items())},
     )
 
 
@@ -123,6 +138,6 @@ def build(repos: list[Path]) -> ServiceGraph:
 def service_graph() -> ServiceGraph:
     base = dev_dir()
     if not base.exists():
-        return ServiceGraph({}, {}, {})
+        return ServiceGraph({}, {}, {}, {}, {})
     repos = sorted(p for p in base.iterdir() if p.is_dir() and not p.name.startswith("."))
     return build(repos)

@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from systemmodel.core.clientlibs import client_type_name, hosts_reached
 from systemmodel.core.config import acknowledged_exposure, aggregate_kinds, repo_kind_override
 from systemmodel.core.evidence import Evidence
 from systemmodel.core.filters import iter_files, read_text
@@ -673,48 +674,7 @@ def _host_aliases(repo: Path, facts: dict) -> list[str]:
     return seen
 
 
-@dataclass(frozen=True)
-class LibraryClientTarget:
-    provided_by_artifacts: tuple[str, ...]
-    hardcoded_hosts: tuple[str, ...]
-
-
-_ARTIFACTS_EXPOSING_SECURE_HTTP_UTILS = (
-    "secure-http-utils", "micronaut-utility-beans", "datastore-client", "event-client",
-)
-_AUTH_HOST = "auth.trevorism.com"
-_DATASTORE_HOST = "datastore.data.trevorism.com"
-_EVENT_HOST = "event.data.trevorism.com"
-_SCHEDULE_HOST = "schedule.action.trevorism.com"
-
-_DATASTORE_CLIENT = LibraryClientTarget(("datastore-client",), (_DATASTORE_HOST, _AUTH_HOST))
-_EVENT_CLIENT = LibraryClientTarget(("event-client",), (_EVENT_HOST,))
-_SCHEDULE_CLIENT = LibraryClientTarget(("schedule-client",), (_SCHEDULE_HOST, _AUTH_HOST))
-_TOKEN_MINTING_CLIENT = LibraryClientTarget(_ARTIFACTS_EXPOSING_SECURE_HTTP_UTILS, (_AUTH_HOST,))
-
-LIBRARY_CLIENT_TARGETS: dict[str, LibraryClientTarget] = {
-    "SecureHttpClient": _TOKEN_MINTING_CLIENT,
-    "AppClientSecureHttpClient": _TOKEN_MINTING_CLIENT,
-    "Repository": _DATASTORE_CLIENT,
-    "FastDatastoreRepository": _DATASTORE_CLIENT,
-    "PingingDatastoreRepository": _DATASTORE_CLIENT,
-    "EventClient": _EVENT_CLIENT,
-    "DefaultEventClient": _EVENT_CLIENT,
-    "ChannelClient": _EVENT_CLIENT,
-    "DefaultChannelClient": _EVENT_CLIENT,
-    "AlertClient": LibraryClientTarget(("reactions-client",), ("alert.action.trevorism.com",)),
-    "EmailClient": LibraryClientTarget(("reactions-client",), ("email.action.trevorism.com",)),
-    "ListContentClient": LibraryClientTarget(("reactions-client",), ("list.data.trevorism.com",)),
-    "TestErrorClient": LibraryClientTarget(("reactions-client",), ("testing.trevorism.com",)),
-    "ScheduleService": _SCHEDULE_CLIENT,
-    "DefaultScheduleService": _SCHEDULE_CLIENT,
-}
-
-
-def _client_type_name(declaration: str) -> str:
-    without_generics = declaration.split("<", 1)[0].strip()
-    words = without_generics.split()
-    return words[-1] if words else ""
+_client_type_name = client_type_name
 
 
 def _declared_client_types(repo: Path) -> set[str]:
@@ -729,14 +689,7 @@ def _declared_client_types(repo: Path) -> set[str]:
 
 
 def _library_calls(repo: Path, declared_artifacts: set[str]) -> dict[str, list[str]]:
-    reached: dict[str, set[str]] = {}
-    for type_name in _declared_client_types(repo):
-        target = LIBRARY_CLIENT_TARGETS.get(type_name)
-        if not target or declared_artifacts.isdisjoint(target.provided_by_artifacts):
-            continue
-        for host in target.hardcoded_hosts:
-            reached.setdefault(host, set()).add(type_name)
-    return {host: sorted(reached[host]) for host in sorted(reached)}
+    return hosts_reached(_declared_client_types(repo), declared_artifacts)
 
 
 def _wiring(repo: Path) -> dict:

@@ -261,7 +261,8 @@ re-runs are diff-stable and later phases get a cheap change-stream.
 systemmodel/
   core/           # system-agnostic: schema, render, adapter interface+registry, locate, filters
   adapters/
-    micronaut_groovy/   # first adapter: Micronaut + Groovy + Gradle + GCP App Engine
+    micronaut_groovy/     # Micronaut + Groovy + Gradle + GCP App Engine (the service archetype)
+    java_gradle_library/  # plain Java + Gradle shared libraries (the client libs)
   derive.py       # CLI: select adapter -> extract -> render
 ```
 
@@ -283,9 +284,18 @@ which the render/apply core preserves and excludes from hashing/diffing.
 
 ## Known limitations
 
-- Extraction is regex/line based; generics with internal spaces (`Map<String, String>`) and
-  unconventional layouts may be partially captured.
-- Only the `micronaut_groovy` adapter exists, so repos without Micronaut/Groovy markers (e.g. some
-  pure-Java shared libraries) aren't detected/classified at all — they'd need their own adapter.
+- Extraction is regex/line based, so unconventional layouts may be partially captured. Generics
+  with internal spaces (`Map<String, String>`) are handled in the Java adapter's signature parsing
+  but can still be truncated by the Micronaut adapter's field/collaborator extraction.
+- Two adapters exist (`micronaut_groovy`, `java_gradle_library`), so the eight remaining repos —
+  CI workflow definitions, npm packages, Cypress suites, this tool — aren't detected or classified
+  at all. Each would need its own adapter.
+- `secure-http-utils`, `reactions-client` and `schedule-client` are consumed as published jars and
+  have no checkout under the container, so the hosts they reach stay hand-recorded in
+  `core/clientlibs.py`. The entries for libraries that *are* checked out are verified against
+  their source by `tests/test_java_library_adapter.py`; those three are not.
+- A library's `declared as a dependency by` counts only repos naming the artifact in their own
+  `build.gradle`. Transitive consumers (e.g. everything reaching `http-utils` through
+  `secure-http-utils`) are real but uncounted — treat the number as a floor.
 - The conformance gate (`--gate`) produces a failing exit code, but isn't yet wired into the
   test-result pipeline as a suite result (roadmap item 3).
