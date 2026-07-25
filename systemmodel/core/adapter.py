@@ -29,6 +29,10 @@ class Adapter(Protocol):
         """L1: the service/repo as a whole."""
         ...
 
+    def extract_capabilities(self, repo: Path) -> Node:
+        """L1: the end-user view — what the service lets people/services do (user stories)."""
+        ...
+
     def extract_modules(self, repo: Path) -> list[Node]:
         """L2: modules (controllers, services, domain, ...)."""
         ...
@@ -89,8 +93,16 @@ def select(repo: Path, name: str | None = None) -> Adapter:
 
 
 def extract_all(adapter: Adapter, repo: Path) -> list[Node]:
-    """Run all four extractors and return the flat list of Nodes."""
+    """Run every extractor and return the flat list of Nodes.
+
+    Order mirrors the intended read altitude: the service identity, then its end-user
+    capabilities, then the L2 modules and the L3/L4 conventions/invariants beneath them.
+    `extract_capabilities` is optional so an older adapter without it still works.
+    """
     nodes: list[Node] = [adapter.extract_service(repo)]
+    get_caps = getattr(adapter, "extract_capabilities", None)
+    if callable(get_caps):
+        nodes.append(get_caps(repo))
     nodes.extend(adapter.extract_modules(repo))
     nodes.append(adapter.extract_conventions(repo))
     nodes.append(adapter.extract_invariants(repo))

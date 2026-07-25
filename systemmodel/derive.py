@@ -29,7 +29,9 @@ from systemmodel.core.apply import build_brief, spec_gaps
 from systemmodel.core.auto import run_auto
 from systemmodel.core.config import aggregate_kinds, authored_signals
 from systemmodel.core.locate import dev_dir, model_root, platform_model_root, resolve_repo
-from systemmodel.core.platform import aggregate, conformance, display_value as _disp, render_platform
+from systemmodel.core.platform import (
+    aggregate, conformance, display_value as _disp, render_platform, render_platform_capabilities,
+)
 from systemmodel.core.render import read_manifest, render
 
 
@@ -72,6 +74,9 @@ def _process_repo(repo: Path, args, generated_at: str) -> tuple[str, list[str], 
     detail = [f"[{n.level.value}] {n.path} ({n.content_hash()})" for n in nodes]
     if result.pruned:
         detail.append(f"pruned {len(result.pruned)}: {', '.join(result.pruned)}")
+    if result.dropped_authored:
+        detail.append(f"dropped authored intent (capability gone): "
+                      f"{', '.join(result.dropped_authored)}")
     return (("planned" if args.dry_run else "written"), detail, adapter.name)
 
 
@@ -126,6 +131,7 @@ def _derive_platform(args, generated_at: str) -> int:
     agg_kinds = aggregate_kinds()
     census: dict[str, list[str]] = {}
     records: list[tuple[str, dict]] = []
+    cap_summaries: list[tuple[str, dict]] = []
     specs: dict = {}
     adapters_used: set[str] = set()
     for repo in _candidate_repos():
@@ -145,10 +151,14 @@ def _derive_platform(args, generated_at: str) -> int:
                 continue  # not a service — excluded from invariant/convention aggregation
             sigs = get_sigs(repo)
             repo_specs = get_specs()
+            get_caps = getattr(adapter, "capability_summary", None)
+            cap_sum = get_caps(repo) if callable(get_caps) else None
         except Exception as e:  # one bad repo shouldn't sink the aggregation
             print(f"  {repo.name}: ERROR {type(e).__name__}: {e}", file=sys.stderr)
             continue
         records.append((repo.name, sigs))
+        if cap_sum is not None:
+            cap_summaries.append((repo.name, cap_sum))
         for s in repo_specs:
             specs[s.key] = s
         adapters_used.add(adapter.name)
@@ -183,6 +193,8 @@ def _derive_platform(args, generated_at: str) -> int:
         return 1
 
     nodes = render_platform(aggs, census, agg_kinds, repos_used, adapters_used)
+    if cap_summaries:
+        nodes.append(render_platform_capabilities(cap_summaries))
     root = platform_model_root()
     result = render(root, nodes, adapter="+".join(sorted(adapters_used)), target="platform",
                     generated_at=generated_at, dry_run=args.dry_run or args.check)

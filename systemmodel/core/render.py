@@ -11,6 +11,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from systemmodel.core.overlay import merge_authored, region_ids, split_authored
 from systemmodel.core.schema import GENERATOR_VERSION, Node, frontmatter
 
 
@@ -21,6 +22,11 @@ class RenderResult:
     manifest: dict
     dry_run: bool
     pruned: list[str]
+    dropped_authored: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.dropped_authored is None:
+            self.dropped_authored = []
 
 
 def read_manifest(root: Path) -> dict | None:
@@ -34,10 +40,29 @@ def read_manifest(root: Path) -> dict | None:
         return None
 
 
-def _document(node: Node, *, adapter: str) -> str:
+def _document(node: Node, *, adapter: str, body: str | None = None) -> str:
     fm = frontmatter(node, adapter=adapter)
-    body = node.body.rstrip("\n")
-    return f"{fm}\n\n{body}\n"
+    text = (body if body is not None else node.body).rstrip("\n")
+    return f"{fm}\n\n{text}\n"
+
+
+def _authored_body(node: Node, root: Path) -> tuple[str, list[str]]:
+    """Compose an authored-supporting node's file body, preserving prior human prose.
+
+    Recovers authored regions from the node's prior on-disk file and re-injects them into the
+    freshly derived body. Returns `(body, dropped)` where `dropped` are region ids the prior file
+    had authored prose for but that this derivation no longer produces (their capability is gone).
+    The node's `body`/`content_hash` are unchanged — only the *written* file carries the prose.
+    """
+    prior = root / node.path
+    if not prior.is_file():
+        return node.body, []
+    _, authored = split_authored(prior.read_text(encoding="utf-8"))
+    if not authored:
+        return node.body, []
+    current_ids = region_ids(node.body)
+    dropped = sorted(rid for rid in authored if rid not in current_ids)
+    return merge_authored(node.body, authored), dropped
 
 
 def build_manifest(nodes: list[Node], *, adapter: str, target: str, generated_at: str) -> dict:
@@ -83,8 +108,14 @@ def render(
     )
 
     documents: dict[str, str] = {}
+    dropped_authored: list[str] = []
     for node in nodes:
-        documents[node.path] = _document(node, adapter=adapter)
+        if node.supports_authored:
+            body, dropped = _authored_body(node, root)
+            documents[node.path] = _document(node, adapter=adapter, body=body)
+            dropped_authored.extend(f"{node.path}:{rid}" for rid in dropped)
+        else:
+            documents[node.path] = _document(node, adapter=adapter)
     documents["MANIFEST.json"] = json.dumps(manifest, indent=2) + "\n"
 
     # Prune only what a previous run recorded in the manifest and this run no longer
@@ -117,4 +148,5 @@ def render(
         dest.write_text(content, encoding="utf-8", newline="\n")
 
     return RenderResult(root=root, files=written, manifest=manifest,
-                        dry_run=dry_run, pruned=pruned)
+                        dry_run=dry_run, pruned=pruned,
+                        dropped_authored=sorted(dropped_authored))
