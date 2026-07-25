@@ -5,12 +5,18 @@ expensive question in a many-service platform ("if I change this, what breaks?")
 purely deterministic — every repo already reports its own host and its outbound hosts, so the
 consumer index falls out of matching one against the other.
 
+Outbound hosts arrive two ways: named literally in a repo's own source, or hardcoded inside a
+shared client library the repo uses — the common case here, where a repo depends hard on a
+service without ever spelling its name. Adapters report the second kind under `library_calls`;
+both merge into one edge set, with the library ones attributed to the client type that carries
+them so a reader can see why the edge is claimed.
+
 Built once per process. The scan is cheap (host + outbound URLs per repo), so no cache file is
 kept on disk and there is no staleness to reason about.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
@@ -23,12 +29,16 @@ class ServiceGraph:
     host_to_repo: dict[str, str]
     calls: dict[str, list[str]]
     consumed_by: dict[str, list[str]]
+    mediated_by: dict[str, dict[str, list[str]]] = field(default_factory=dict)
 
     def callers_of(self, repo_name: str) -> list[str]:
         return self.consumed_by.get(repo_name, [])
 
     def callees_of(self, repo_name: str) -> list[str]:
         return self.calls.get(repo_name, [])
+
+    def mediators_of(self, caller: str, target: str) -> list[str]:
+        return self.mediated_by.get(caller, {}).get(target, [])
 
     def hubs(self, minimum: int = 2) -> list[tuple[str, int]]:
         """Services many others depend on, most-depended-on first — the risky things to change."""
@@ -58,6 +68,7 @@ def normalize_host(host: str) -> str:
 def build(repos: list[Path]) -> ServiceGraph:
     claims: dict[str, set[str]] = {}
     outbound: dict[str, list[str]] = {}
+    through_libraries: dict[str, dict[str, list[str]]] = {}
 
     for repo in repos:
         try:
@@ -74,6 +85,8 @@ def build(repos: list[Path]) -> ServiceGraph:
         for alias in info.get("hosts") or []:
             claims.setdefault(normalize_host(alias), set()).add(repo.name)
         outbound[repo.name] = [normalize_host(h) for h in info.get("calls", [])]
+        through_libraries[repo.name] = {normalize_host(host): list(clients)
+                                        for host, clients in (info.get("library_calls") or {}).items()}
 
     # An alias claimed by more than one repo cannot identify a target, so drop it rather
     # than attribute an edge to an arbitrary winner.
@@ -81,10 +94,20 @@ def build(repos: list[Path]) -> ServiceGraph:
 
     calls: dict[str, list[str]] = {}
     consumed_by: dict[str, list[str]] = {}
+    mediated_by: dict[str, dict[str, list[str]]] = {}
     for name, hosts in outbound.items():
-        targets = sorted({host_to_repo[h] for h in hosts
-                          if h in host_to_repo and host_to_repo[h] != name})
+        direct = {host_to_repo[h] for h in hosts
+                  if h in host_to_repo and host_to_repo[h] != name}
+        via: dict[str, set[str]] = {}
+        for host, clients in through_libraries.get(name, {}).items():
+            target = host_to_repo.get(host)
+            if target is None or target == name or target in direct:
+                continue
+            via.setdefault(target, set()).update(clients)
+        targets = sorted(direct | set(via))
         calls[name] = targets
+        if via:
+            mediated_by[name] = {t: sorted(via[t]) for t in sorted(via)}
         for target in targets:
             consumed_by.setdefault(target, []).append(name)
 
@@ -92,6 +115,7 @@ def build(repos: list[Path]) -> ServiceGraph:
         host_to_repo=host_to_repo,
         calls=calls,
         consumed_by={k: sorted(v) for k, v in consumed_by.items()},
+        mediated_by=mediated_by,
     )
 
 

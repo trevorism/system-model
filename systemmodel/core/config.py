@@ -65,6 +65,21 @@ def _flatten(table: dict, prefix: str = "") -> dict[str, object]:
     return out
 
 
+def authored_exceptions() -> dict[str, dict[str, str]]:
+    entries = _load().get("exceptions", [])
+    if not isinstance(entries, list):
+        return {}
+    by_signal: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        signal, repo, reason = entry.get("signal"), entry.get("repo"), entry.get("reason", "")
+        if not (isinstance(signal, str) and signal and isinstance(repo, str) and repo):
+            continue
+        by_signal.setdefault(signal, {})[repo] = reason if isinstance(reason, str) else ""
+    return by_signal
+
+
 def authored_signals() -> dict[str, object]:
     """Prescriptive required/expected value per platform signal key.
 

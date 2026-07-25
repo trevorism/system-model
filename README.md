@@ -176,6 +176,26 @@ violations, repos in violation); `invariants.md` / `conventions.md` mark each au
 **REQUIRED** with a conform count and violators, while un-authored signals stay labeled as the
 observed norm. (This is platform-level authoring; per-repo authored specs are a later slice.)
 
+### Exceptions (one repo, one signal, with a reason)
+
+Some services legitimately don't satisfy a platform-wide requirement. Reclassifying such a repo
+via `[repos]` would exempt it from *every* service invariant — too blunt. An `[[exceptions]]`
+entry excuses **one repo from one signal** and nothing else:
+
+```toml
+[[exceptions]]
+signal = "security.enabled"
+repo   = "timeline"
+reason = "Pure computation: geometry in, geometry out. No repository, datastore, outbound client
+          or persistence, and nothing consumes it — there is no data an auth check would guard."
+```
+
+The repo keeps its `service` kind and is still measured against every other requirement, so the
+requirement keeps biting for the rest of the platform. An exception is never silent: `--gate`
+prints it (and still exits 0), `platform.md` gets an **Authored exceptions** section with the
+reason, and the `invariants.md` line shows `excepted by platform.toml` with the repo's actual
+value — an excused repo is **not** counted as conforming (`36/37`, not `37/37`).
+
 ## Two directions: derive vs apply
 
 The model reconciles code and intent, and **you pick which side wins by the command you run**:

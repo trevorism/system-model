@@ -133,6 +133,7 @@ class Controller:
     endpoints: list[Endpoint] = field(default_factory=list)
     injects: list[tuple[str, str]] = field(default_factory=list)
     constructor_params: list[str] = field(default_factory=list)
+    collaborators: list[str] = field(default_factory=list)
 
 
 def _join_route(prefix: str, value: str) -> str:
@@ -179,7 +180,8 @@ def _parse_controller(repo: Path, path: Path) -> Controller | None:
     prefix = _first_string(prefix_m.group(1)) if prefix_m else "/"
     prefix = prefix or "/"
 
-    ctrl = Controller(name=name, prefix=prefix, file=_rel(repo, path))
+    ctrl = Controller(name=name, prefix=prefix, file=_rel(repo, path),
+                      collaborators=_collaborators(text))
 
     # constructor params (constructor injection): `Name(...) {`
     for m in re.finditer(rf"\b{re.escape(name)}\s*\(([^)]*)\)\s*\{{", text):
@@ -281,9 +283,12 @@ class Service:
     collaborators: list[str] = field(default_factory=list)
 
 
+_FIELD_DECL = re.compile(r"private\s+(?:(?:final|static|transient|volatile)\s+)*([\w<>]+)\s+\w+")
+
+
 def _collaborators(text: str) -> list[str]:
     found: list[str] = []
-    for fm in re.finditer(r"private\s+([\w<>]+)\s+\w+", text):
+    for fm in _FIELD_DECL.finditer(text):
         t = fm.group(1)
         if any(t.endswith(sfx) or t.startswith(sfx) for sfx in ("Client", "Service", "Repository")):
             found.append(t)
@@ -667,6 +672,72 @@ def _host_aliases(repo: Path, facts: dict) -> list[str]:
     return seen
 
 
+@dataclass(frozen=True)
+class LibraryClientTarget:
+    provided_by_artifacts: tuple[str, ...]
+    hardcoded_hosts: tuple[str, ...]
+
+
+_ARTIFACTS_EXPOSING_SECURE_HTTP_UTILS = (
+    "secure-http-utils", "micronaut-utility-beans", "datastore-client", "event-client",
+)
+_AUTH_HOST = "auth.trevorism.com"
+_DATASTORE_HOST = "datastore.data.trevorism.com"
+_EVENT_HOST = "event.data.trevorism.com"
+_SCHEDULE_HOST = "schedule.action.trevorism.com"
+
+_DATASTORE_CLIENT = LibraryClientTarget(("datastore-client",), (_DATASTORE_HOST, _AUTH_HOST))
+_EVENT_CLIENT = LibraryClientTarget(("event-client",), (_EVENT_HOST,))
+_SCHEDULE_CLIENT = LibraryClientTarget(("schedule-client",), (_SCHEDULE_HOST, _AUTH_HOST))
+_TOKEN_MINTING_CLIENT = LibraryClientTarget(_ARTIFACTS_EXPOSING_SECURE_HTTP_UTILS, (_AUTH_HOST,))
+
+LIBRARY_CLIENT_TARGETS: dict[str, LibraryClientTarget] = {
+    "SecureHttpClient": _TOKEN_MINTING_CLIENT,
+    "AppClientSecureHttpClient": _TOKEN_MINTING_CLIENT,
+    "Repository": _DATASTORE_CLIENT,
+    "FastDatastoreRepository": _DATASTORE_CLIENT,
+    "PingingDatastoreRepository": _DATASTORE_CLIENT,
+    "EventClient": _EVENT_CLIENT,
+    "DefaultEventClient": _EVENT_CLIENT,
+    "ChannelClient": _EVENT_CLIENT,
+    "DefaultChannelClient": _EVENT_CLIENT,
+    "AlertClient": LibraryClientTarget(("reactions-client",), ("alert.action.trevorism.com",)),
+    "EmailClient": LibraryClientTarget(("reactions-client",), ("email.action.trevorism.com",)),
+    "ListContentClient": LibraryClientTarget(("reactions-client",), ("list.data.trevorism.com",)),
+    "TestErrorClient": LibraryClientTarget(("reactions-client",), ("testing.trevorism.com",)),
+    "ScheduleService": _SCHEDULE_CLIENT,
+    "DefaultScheduleService": _SCHEDULE_CLIENT,
+}
+
+
+def _client_type_name(declaration: str) -> str:
+    without_generics = declaration.split("<", 1)[0].strip()
+    words = without_generics.split()
+    return words[-1] if words else ""
+
+
+def _declared_client_types(repo: Path) -> set[str]:
+    declarations: set[str] = set()
+    for svc in _parse_services(repo):
+        declarations.update(svc.collaborators)
+    for ctrl in _all_controllers(repo):
+        declarations.update(ctrl.collaborators)
+        declarations.update(t for t, _ in ctrl.injects)
+        declarations.update(ctrl.constructor_params)
+    return {name for name in map(_client_type_name, declarations) if name}
+
+
+def _library_calls(repo: Path, declared_artifacts: set[str]) -> dict[str, list[str]]:
+    reached: dict[str, set[str]] = {}
+    for type_name in _declared_client_types(repo):
+        target = LIBRARY_CLIENT_TARGETS.get(type_name)
+        if not target or declared_artifacts.isdisjoint(target.provided_by_artifacts):
+            continue
+        for host in target.hardcoded_hosts:
+            reached.setdefault(host, set()).add(type_name)
+    return {host: sorted(reached[host]) for host in sorted(reached)}
+
+
 def _wiring(repo: Path) -> dict:
     facts = _service_facts(repo)
     aliases = _host_aliases(repo, facts)
@@ -683,10 +754,14 @@ def _wiring(repo: Path) -> dict:
         hosts.discard(alias)
     build = _read(repo, "build.gradle") or ""
     libs = {lib for lib in _SHARED_LIB.findall(build) if not lib.endswith("-plugin")}
+    library_calls = _library_calls(repo, libs)
+    for alias in aliases:
+        library_calls.pop(alias, None)
     return {
         "host": own_host,
         "hosts": aliases,
         "calls": sorted(hosts),
+        "library_calls": library_calls,
         "publishes_topics": sorted(topics),
         "shared_libraries": sorted(libs),
     }
@@ -735,6 +810,11 @@ def _md_overview(repo: Path, f: dict, wiring: dict, risks: list[str], evidence_h
     lines += ["## Wiring", ""]
     calls = " · ".join(wiring["calls"]) or "_(nothing outbound)_"
     lines.append(f"- **calls** → {calls}")
+    via_libs = wiring.get("library_calls") or {}
+    if via_libs:
+        reached = " · ".join(f"{host} (via `{'`, `'.join(clients)}`)"
+                             for host, clients in via_libs.items())
+        lines.append(f"- **calls via libraries** → {reached}")
     consumers = wiring.get("consumed_by") or []
     lines.append(f"- **consumed by** → {', '.join(consumers) if consumers else '_(nothing calls this)_'}")
     if wiring["publishes_topics"]:

@@ -27,11 +27,11 @@ from systemmodel.core import adapter as adapters
 from systemmodel.core.adapter import extract_all
 from systemmodel.core.apply import build_brief, spec_gaps
 from systemmodel.core.auto import run_auto
-from systemmodel.core.config import aggregate_kinds, authored_signals
+from systemmodel.core.config import aggregate_kinds, authored_exceptions, authored_signals
 from systemmodel.core.graph import service_graph
 from systemmodel.core.locate import dev_dir, model_root, platform_model_root, resolve_repo
 from systemmodel.core.platform import (
-    aggregate, conformance, display_value as _disp, render_platform,
+    aggregate, conformance, display_value as _disp, exception_lines, render_platform,
 )
 from systemmodel.core.render import read_manifest, render
 from systemmodel.core.synth import resolve as synth_resolve
@@ -185,24 +185,30 @@ def _derive_platform(args, generated_at: str) -> int:
     # Provenance/counts reflect the repos actually aggregated (a service whose signals
     # raised is in the census but not in records).
     repos_used = sorted(r for r, _ in records)
-    aggs = aggregate(records, specs, authored_signals())
+    aggs = aggregate(records, specs, authored_signals(), authored_exceptions())
 
     # Conformance gate: measure code against authored platform.toml requirements; write nothing.
     if args.gate:
         conf = conformance(aggs)
+        excused = exception_lines(conf)
         if not conf.required:
             print(f"clean - no authored requirements in platform.toml (nothing to gate); "
                   f"scanned {len(repos_used)} repos")
             return 0
         if not conf.violating_signals:
             print(f"clean - all {len(conf.required)} authored requirement(s) hold across "
-                  f"{len(repos_used)} repos")
+                  f"{len(repos_used)} repos"
+                  + (f", with {len(excused)} authored exception(s):" if excused else ""))
+            for line in excused:
+                print(f"  excepted: {line}")
             return 0
         print(f"VIOLATION - {len(conf.violating_signals)} authored requirement(s) violated "
               f"across {len(conf.repos_in_violation)} repo(s):")
         for a in conf.violating_signals:
             violators = ", ".join(f"{r}=`{_disp(v)}`" for r, v in a.violators())
             print(f"  {a.spec.label}: REQUIRED `{_disp(a.authored)}` — {violators}")
+        for line in excused:
+            print(f"  excepted: {line}")
         print(f"repos in violation: {', '.join(conf.repos_in_violation)}")
         print("run: uv run systemmodel --platform   (for the full report)")
         return 1
