@@ -33,6 +33,7 @@ from systemmodel.core.platform import (
     aggregate, conformance, display_value as _disp, render_platform, render_platform_capabilities,
 )
 from systemmodel.core.render import read_manifest, render
+from systemmodel.core.synth import resolve as synth_resolve
 
 
 def _drift(mroot: Path, new_manifest: dict, pruned: list[str]) -> list[str]:
@@ -60,18 +61,31 @@ def _drift(mroot: Path, new_manifest: dict, pruned: list[str]) -> list[str]:
     return lines
 
 
+def _synthesize(repo: Path, adapter, nodes: list, args) -> tuple[dict, list[str]]:
+    """Resolve synthesized prose for a writing derive. Never called by --check/--gate/--dry-run,
+    which reconcile the skeleton and so must stay free, offline and deterministic."""
+    get_evidence = getattr(adapter, "extract_evidence", None)
+    if not callable(get_evidence):
+        return {}, []
+    return synth_resolve(repo, nodes, get_evidence(repo), model=args.model)
+
+
 def _process_repo(repo: Path, args, generated_at: str) -> tuple[str, list[str], str]:
     """Derive one repo. Returns (status, detail_lines, adapter_name)."""
     adapter = adapters.select(repo, args.adapter)
     nodes = extract_all(adapter, repo)
     mroot = model_root(repo)
+    writing = not (args.dry_run or args.check)
+    prose, regenerated = _synthesize(repo, adapter, nodes, args) if writing else ({}, [])
     # --check never writes; it renders in dry-run to compute the new manifest + stale files.
     result = render(mroot, nodes, adapter=adapter.name, target=repo.name,
-                    generated_at=generated_at, dry_run=args.dry_run or args.check)
+                    generated_at=generated_at, dry_run=not writing, synth_prose=prose)
     if args.check:
         drift = _drift(mroot, result.manifest, result.pruned)
         return ("drift" if drift else "clean", drift, adapter.name)
     detail = [f"[{n.level.value}] {n.path} ({n.content_hash()})" for n in nodes]
+    if regenerated:
+        detail.append(f"re-synthesized: {', '.join(regenerated)}")
     if result.pruned:
         detail.append(f"pruned {len(result.pruned)}: {', '.join(result.pruned)}")
     if result.dropped_authored:

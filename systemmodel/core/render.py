@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from systemmodel.core.overlay import merge_authored, region_ids, split_authored
+from systemmodel.core.overlay import merge_authored, merge_synth, region_ids, split_authored
 from systemmodel.core.schema import GENERATOR_VERSION, Node, frontmatter
 
 
@@ -46,23 +46,27 @@ def _document(node: Node, *, adapter: str, body: str | None = None) -> str:
     return f"{fm}\n\n{text}\n"
 
 
-def _authored_body(node: Node, root: Path) -> tuple[str, list[str]]:
-    """Compose an authored-supporting node's file body, preserving prior human prose.
+def _authored_body(node: Node, root: Path, synth_prose: dict[str, str] | None) -> tuple[str, list[str]]:
+    """Compose an overlay-supporting node's file body from derived content plus preserved prose.
 
     Recovers authored regions from the node's prior on-disk file and re-injects them into the
-    freshly derived body. Returns `(body, dropped)` where `dropped` are region ids the prior file
-    had authored prose for but that this derivation no longer produces (their capability is gone).
-    The node's `body`/`content_hash` are unchanged — only the *written* file carries the prose.
+    freshly derived body, then layers on any synthesized prose the caller resolved. Returns
+    `(body, dropped)` where `dropped` are region ids the prior file had authored prose for but
+    that this derivation no longer produces (their capability is gone). The node's
+    `body`/`content_hash` are unchanged — only the *written* file carries the prose.
     """
+    body = node.body
+    dropped: list[str] = []
     prior = root / node.path
-    if not prior.is_file():
-        return node.body, []
-    _, authored = split_authored(prior.read_text(encoding="utf-8"))
-    if not authored:
-        return node.body, []
-    current_ids = region_ids(node.body)
-    dropped = sorted(rid for rid in authored if rid not in current_ids)
-    return merge_authored(node.body, authored), dropped
+    if prior.is_file():
+        _, authored = split_authored(prior.read_text(encoding="utf-8"))
+        if authored:
+            current_ids = region_ids(node.body)
+            dropped = sorted(rid for rid in authored if rid not in current_ids)
+            body = merge_authored(body, authored)
+    if synth_prose:
+        body = merge_synth(body, synth_prose)
+    return body, dropped
 
 
 def build_manifest(nodes: list[Node], *, adapter: str, target: str, generated_at: str) -> dict:
@@ -95,6 +99,7 @@ def render(
     target: str,
     generated_at: str,
     dry_run: bool = False,
+    synth_prose: dict[str, dict[str, str]] | None = None,
 ) -> RenderResult:
     """Write the model tree into `out_root` (or preview if dry_run).
 
@@ -111,7 +116,7 @@ def render(
     dropped_authored: list[str] = []
     for node in nodes:
         if node.supports_authored:
-            body, dropped = _authored_body(node, root)
+            body, dropped = _authored_body(node, root, (synth_prose or {}).get(node.path))
             documents[node.path] = _document(node, adapter=adapter, body=body)
             dropped_authored.extend(f"{node.path}:{rid}" for rid in dropped)
         else:

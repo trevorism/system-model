@@ -25,8 +25,12 @@ class Adapter(Protocol):
         """True if this adapter understands the given repo."""
         ...
 
-    def extract_service(self, repo: Path) -> Node:
-        """L1: the service/repo as a whole."""
+    def extract_overview(self, repo: Path) -> Node:
+        """L1: the lead read — synthesized purpose/requirements over derived wiring and risk."""
+        ...
+
+    def extract_evidence(self, repo: Path):
+        """The deterministic facts a synthesis pass reasons over (core/evidence.Evidence)."""
         ...
 
     def extract_capabilities(self, repo: Path) -> Node:
@@ -35,14 +39,6 @@ class Adapter(Protocol):
 
     def extract_modules(self, repo: Path) -> list[Node]:
         """L2: modules (controllers, services, domain, ...)."""
-        ...
-
-    def extract_conventions(self, repo: Path) -> Node:
-        """L3: build/test/naming conventions."""
-        ...
-
-    def extract_invariants(self, repo: Path) -> Node:
-        """L4: enforced invariants (coverage gate, security, transport, ...)."""
         ...
 
     def platform_signal_specs(self) -> list:
@@ -95,15 +91,14 @@ def select(repo: Path, name: str | None = None) -> Adapter:
 def extract_all(adapter: Adapter, repo: Path) -> list[Node]:
     """Run every extractor and return the flat list of Nodes.
 
-    Order mirrors the intended read altitude: the service identity, then its end-user
-    capabilities, then the L2 modules and the L3/L4 conventions/invariants beneath them.
-    `extract_capabilities` is optional so an older adapter without it still works.
+    Order mirrors the intended read altitude: the overview a human reads first, then the
+    deterministic detail layers beneath it. Each extractor is optional so an adapter that
+    predates a given layer still works.
     """
-    nodes: list[Node] = [adapter.extract_service(repo)]
-    get_caps = getattr(adapter, "extract_capabilities", None)
-    if callable(get_caps):
-        nodes.append(get_caps(repo))
+    nodes: list[Node] = []
+    for name in ("extract_overview", "extract_capabilities"):
+        extractor = getattr(adapter, name, None)
+        if callable(extractor):
+            nodes.append(extractor(repo))
     nodes.extend(adapter.extract_modules(repo))
-    nodes.append(adapter.extract_conventions(repo))
-    nodes.append(adapter.extract_invariants(repo))
     return nodes
