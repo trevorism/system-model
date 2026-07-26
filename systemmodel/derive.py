@@ -31,7 +31,7 @@ from systemmodel.core.apply import authored_requirements, build_brief, requireme
 from systemmodel.core.auto import run_auto
 from systemmodel.core import features
 from systemmodel.core.config import (
-    acknowledged_exposure, aggregate_kinds, authored_exceptions, authored_signals,
+    acknowledged_exposure, aggregate_kinds, authored_exceptions, authored_signals, feature_kinds,
 )
 from systemmodel.core.graph import service_graph
 from systemmodel.core.locate import dev_dir, model_root, platform_model_root, resolve_repo
@@ -136,6 +136,13 @@ def _feature_layer(repo: Path, adapter, args, writing: bool) -> tuple[list, dict
         existing = features.load(model_root(repo))
         ordered = [existing[slug] for slug in sorted(existing)]
         return features.nodes(ordered, index), {}, []
+
+    # Kinds outside the policy get no features, and any they already have are pruned. Without
+    # this, deleting a template's features by hand is pointless — the next derive regenerates
+    # them, and spends an agent call doing it.
+    classify = getattr(adapter, "classify", None)
+    if callable(classify) and classify(repo) not in feature_kinds():
+        return [], {}, []
 
     get_evidence = getattr(adapter, "extract_evidence", None)
     if not callable(get_evidence):

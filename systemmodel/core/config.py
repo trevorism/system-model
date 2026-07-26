@@ -15,6 +15,12 @@ from systemmodel.core.locate import systemmodel_dir
 # Which kinds the platform model aggregates invariants/conventions over, by default.
 DEFAULT_AGGREGATE_KINDS = ("service",)
 
+# Which kinds get a feature decomposition. Templates and experiments are excluded by default:
+# a template has no intent of its own, only inherited scaffolding, and decomposing one produced
+# requirements anchored on CI yaml that the index cannot resolve (46% anchored, against 95-100%
+# for real repos). Spending an agent call to freeze weak permanent slugs is worse than nothing.
+DEFAULT_FEATURE_KINDS = ("service", "library", "tester")
+
 
 def config_path():
     return systemmodel_dir() / "platform.toml"
@@ -47,6 +53,14 @@ def aggregate_kinds() -> list[str]:
     if isinstance(kinds, list) and all(isinstance(k, str) for k in kinds) and kinds:
         return list(kinds)
     return list(DEFAULT_AGGREGATE_KINDS)
+
+
+def feature_kinds() -> list[str]:
+    """Repo kinds that get a feature decomposition (default: service, library, tester)."""
+    kinds = _load().get("policy", {}).get("feature_kinds")
+    if isinstance(kinds, list) and all(isinstance(k, str) for k in kinds) and kinds:
+        return list(kinds)
+    return list(DEFAULT_FEATURE_KINDS)
 
 
 def _flatten(table: dict, prefix: str = "") -> dict[str, object]:
