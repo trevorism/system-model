@@ -44,7 +44,10 @@ class Node:
     body: str
     derived_from: list[str] = field(default_factory=list)
     status: str = "derived"  # future: authored | mixed
-    supports_authored: bool = False  # doc interleaves preserved authored regions with `body`
+    # Section title -> hash of the evidence its prose was synthesized from. The bodies of these
+    # sections are empty in `body` (the skeleton) and filled at render time, so they never enter
+    # the content hash and a prose edit is not drift. The hashes live in MANIFEST.json.
+    synth_sections: dict[str, str] = field(default_factory=dict)
 
     def content_hash(self) -> str:
         """Stable hash of the semantic content (body only, not the volatile frontmatter).
@@ -52,11 +55,17 @@ class Node:
         Excluding generated_at/timestamps here is what makes re-runs diff-stable and gives
         later phases a cheap change-stream: the hash only moves when the code-derived facts do.
 
-        `body` is always the *derived* content the adapter produced. For a `supports_authored`
-        node the on-disk file additionally carries preserved authored regions (see
-        core/overlay), but those never enter the hash — so a prose-only edit is not drift.
+        `body` is the skeleton: headings plus the sections the tool derives. Synthesized prose
+        is injected at render time and is absent here, so it cannot affect the hash.
+
+        The section *evidence* hashes are folded in, though. They are not prose — they say which
+        facts the prose was written from, so when they move the document really is stale. Leaving
+        them out would make a section with no requirements beneath it, such as Purpose, silently
+        undetectable once its underlying code changed.
         """
-        return hashlib.sha256(self.body.encode("utf-8")).hexdigest()[:16]
+        material = self.body + "".join(
+            f"\n{title}={evidence}" for title, evidence in sorted(self.synth_sections.items()))
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
 def _yaml_scalar(value: str) -> str:

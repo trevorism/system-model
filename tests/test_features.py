@@ -1,10 +1,11 @@
 """The feature layer: parsing a decomposition, and never losing a slug or a promotion to one."""
 from pathlib import Path
 
+from systemmodel.core.requirements import render as render_requirements
 from systemmodel.core.features import (
     Feature, load, nodes, parse_body, parse_decomposition, prose, reconcile, slugify,
 )
-from systemmodel.core.requirements import AUTHORED, VERIFIED, Requirement, parse_blocks
+from systemmodel.core.requirements import AUTHORED, VERIFIED, Requirement, parse
 
 DECOMPOSITION = """## employment-gap-marking -- Career Gap Detection
 Makes unemployment gaps visible rather than silently closing them up.
@@ -51,10 +52,16 @@ def test_slugify_keeps_it_filename_safe():
     assert slugify("Career Gap Detection!") == "career-gap-detection"
 
 
+def _document(feature: Feature) -> str:
+    """The document render() would produce: skeleton headings with the prose poured in."""
+    return "\n".join([f"# Feature: {feature.slug}", "", "## Summary", "", feature.summary(),
+                      "", "## Requirements", "", render_requirements(feature.requirements), ""])
+
+
 def test_a_feature_document_round_trips():
     original = Feature("timeline-scaling", "Proportional Layout", "Normalises any span.",
                        [Requirement(id="R1", body="Must normalise.", anchors=["MAX_PIXEL_LENGTH"])])
-    recovered = parse_body(original.body())
+    recovered = parse_body(_document(original))
     assert recovered.title == original.title
     assert recovered.purpose == original.purpose
     assert recovered.requirements == original.requirements
@@ -71,7 +78,7 @@ def test_a_dropped_slug_is_kept_and_flagged_rather_than_deleted():
     assert set(result) == set(prior)  # nothing disappeared
     assert result["timeline-scaling"].proposed is True
     assert result["employment-gap-marking"].proposed is False
-    assert "No longer proposed" in result["employment-gap-marking"].body()
+    assert "No longer proposed" in result["employment-gap-marking"].summary()
 
 
 def test_a_promoted_requirement_survives_a_fresh_decomposition():
@@ -95,8 +102,9 @@ def test_the_node_skeleton_carries_only_the_anchor():
     """The title is synthesized, so a skeleton heading would mean two H1s per document."""
     feature = parse_decomposition(DECOMPOSITION)[0]
     body = nodes([feature], INDEX)[0].body
-    assert body.strip().startswith("<!-- synth:feature evidence=")
-    assert "#" not in body
+    assert "## Summary" in body and "## Requirements" in body
+    assert "<!--" not in body
+    assert feature.title not in body  # the synthesized title is prose, not skeleton
 
 
 def test_a_feature_node_moves_only_when_its_anchored_code_moves():
@@ -111,7 +119,7 @@ def test_loading_from_disk_recovers_slugs_and_promotions(tmp_path: Path):
     (root / "features").mkdir(parents=True)
     feature = Feature("timeline-scaling", "Proportional Layout", "Normalises.",
                       [Requirement(id="R1", body="Held.", origin=AUTHORED, state=VERIFIED)])
-    (root / feature.path).write_text(feature.body("abc123"), encoding="utf-8")
+    (root / feature.path).write_text(_document(feature), encoding="utf-8")
 
     loaded = load(root)
     assert list(loaded) == ["timeline-scaling"]
@@ -120,8 +128,8 @@ def test_loading_from_disk_recovers_slugs_and_promotions(tmp_path: Path):
 
 def test_prose_is_keyed_by_document_path():
     feature = parse_decomposition(DECOMPOSITION)[0]
-    payload = prose([feature], "deadbeef")
+    payload = prose([feature])
     assert list(payload) == ["features/employment-gap-marking.md"]
-    body = payload["features/employment-gap-marking.md"]["feature"]
-    assert "<!-- decomposition evidence=deadbeef -->" in body
-    assert parse_blocks(body)[0].anchors == ["fillInGaps", "GAP_THRESHOLD_DAYS"]
+    sections = payload["features/employment-gap-marking.md"]
+    assert "Career Gap Detection" in sections["Summary"]
+    assert parse(sections["Requirements"])[0].anchors == ["fillInGaps", "GAP_THRESHOLD_DAYS"]

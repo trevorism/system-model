@@ -17,26 +17,41 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from systemmodel.core.features import load as load_features
 from systemmodel.core.locate import model_root
+from systemmodel.core.overlay import section_body
+from systemmodel.core.render import recorded_state
 from systemmodel.core.requirements import (
-    UNVERIFIED, VIOLATED, Requirement, parse_blocks,
+    REQUIREMENTS_HEADING, UNVERIFIED, VIOLATED, Requirement, hydrate, parse,
 )
 
+_INTENT = "intent.md"
 
-def authored_requirements(repo: Path) -> list[tuple[str, Requirement]]:
-    """Every authored requirement in the model, as `(document path, requirement)`."""
+
+def all_requirements(repo: Path) -> list[tuple[str, Requirement]]:
+    """Every requirement in the model, as `(document path, requirement)`.
+
+    Records are read from the Markdown and their anchor hashes from the manifest — the two halves
+    of a record now that the prose carries no machine state.
+    """
     root = model_root(repo)
     if not root.exists():
         return []
+    state = recorded_state(root)
     found: list[tuple[str, Requirement]] = []
-    overview = root / "overview.md"
-    if overview.is_file():
-        found += [("overview.md", r) for r in parse_blocks(overview.read_text(encoding="utf-8"))
-                  if r.is_authored]
-    for slug, feature in sorted(load_features(root).items()):
-        found += [(feature.path, r) for r in feature.requirements if r.is_authored]
+    for path in sorted(root.rglob("*.md")):
+        rel = path.relative_to(root).as_posix()
+        if rel == _INTENT:
+            continue
+        section = section_body(path.read_text(encoding="utf-8"), REQUIREMENTS_HEADING)
+        for requirement in hydrate(parse(section or ""),
+                                   state.get(rel, {}).get("requirements", {})):
+            found.append((rel, requirement))
     return found
+
+
+def authored_requirements(repo: Path) -> list[tuple[str, Requirement]]:
+    """Only the binding ones — derived description is never a promise to keep."""
+    return [(path, r) for path, r in all_requirements(repo) if r.is_authored]
 
 
 def requirement_gaps(repo: Path) -> list[tuple[str, Requirement]]:

@@ -21,9 +21,15 @@ from pathlib import Path
 
 from systemmodel.core.evidence import Evidence
 from systemmodel.core.locate import model_root
-from systemmodel.core.overlay import split_regions, synth_requests
-from systemmodel.core.requirements import REQUIREMENTS_REGION, reconcile
+from systemmodel.core.render import recorded_decomposition
+from systemmodel.core.overlay import contains_heading_at_or_above, section_body
+from systemmodel.core.requirements import (
+    REQUIREMENTS_HEADING, hashes as requirement_hashes, hydrate, parse,
+    reconcile, render as render_requirements,
+)
 from systemmodel.core.schema import Node
+
+REQUIREMENTS_KEY = REQUIREMENTS_HEADING.lower()
 
 TIMEOUT_SECONDS = 420
 
@@ -267,7 +273,7 @@ def decompose(repo: Path, evidence: Evidence, index: dict[str, dict], *,
             on_log(reason)
         return reconcile(prior, list(prior.values()), index), stamp, False
 
-    if prior and _recorded_decomposition(repo) == stamp:
+    if prior and recorded_decomposition(model_root(repo)) == stamp:
         return keep()
     if not available():
         return keep("warning: `claude` CLI not found — feature decomposition not refreshed.")
@@ -282,24 +288,21 @@ def decompose(repo: Path, evidence: Evidence, index: dict[str, dict], *,
     return reconcile(prior, fresh, index), stamp, True
 
 
-def _recorded_decomposition(repo: Path) -> str | None:
-    """The evidence hash the on-disk decomposition was built from, from any feature doc."""
-    directory = model_root(repo) / "features"
-    if not directory.is_dir():
-        return None
-    for path in sorted(directory.glob("*.md")):
-        stamp = re.search(r"<!-- decomposition evidence=([0-9a-f]*) -->",
-                          path.read_text(encoding="utf-8"))
-        if stamp:
-            return stamp.group(1)
-    return None
+# The retired comment-delimited form. Read only, so that a model written before sections
+# existed migrates on its next ordinary derive instead of needing a re-synthesis of all 54 repos.
+_LEGACY_REGION = re.compile(
+    r"<!-- synth:(?P<id>[\w.\-:]+)(?:\s+evidence=(?P<ev>[0-9a-f]*))?\s*-->\n"
+    r"(?P<body>.*?)\n<!-- /synth -->", re.DOTALL)
 
 
-def _prior_regions(repo: Path, node: Node) -> dict:
+def _legacy_regions(text: str) -> dict[str, tuple[str, str]]:
+    return {m.group("id").lower(): (m.group("ev") or "", m.group("body"))
+            for m in _LEGACY_REGION.finditer(text)}
+
+
+def _prior_document(repo: Path, node: Node) -> str:
     on_disk = model_root(repo) / node.path
-    if not on_disk.is_file():
-        return {}
-    return split_regions(on_disk.read_text(encoding="utf-8"))[2]
+    return on_disk.read_text(encoding="utf-8") if on_disk.is_file() else ""
 
 
 def available() -> bool:
@@ -307,62 +310,76 @@ def available() -> bool:
 
 
 def resolve(repo: Path, nodes: list[Node], evidence: Evidence, *,
-            model: str | None = None, on_log=print,
+            recorded: dict[str, dict] | None = None, model: str | None = None, on_log=print,
             anchor_index: dict[str, dict] | None = None
-            ) -> tuple[dict[str, dict[str, str]], list[str]]:
-    """Resolve every synth region to prose, generating only what the evidence hash invalidated.
+            ) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]], list[str]]:
+    """Resolve every synthesized section, generating only what the evidence hash invalidated.
 
-    Returns `(prose_by_node_path, regenerated_ids)`. Prose is returned as an overlay rather than
-    merged into `Node.body` so it never enters the content hash.
+    Returns `(prose_by_path, requirement_hashes_by_path, regenerated)`. Prose is returned
+    separately from `Node.body` so it never enters the content hash; the requirement hashes go
+    to the manifest, which is where machine state lives now that the prose carries none.
     """
     prose_by_path: dict[str, dict[str, str]] = {}
+    hashes_by_path: dict[str, dict[str, str]] = {}
     regenerated: list[str] = []
     can_generate = available()
     warned = False
+    state = recorded or {}
 
     for node in nodes:
-        requests = synth_requests(node.body)
-        if not requests:
+        # Feature documents resolve through decompose(), which writes both their sections in one
+        # call; letting them through here would redo that work and then be overwritten.
+        if not node.synth_sections or node.kind == "feature":
             continue
-        prior = _prior_regions(repo, node)
+        prior_text = _prior_document(repo, node)
+        legacy = _legacy_regions(prior_text)
+        prior_regions = state.get(node.path, {}).get("regions", {})
+        prior_reqs = state.get(node.path, {}).get("requirements", {})
         resolved: dict[str, str] = {}
-        for region_id, current_evidence in requests.items():
-            known = prior.get(region_id)
-            prior_prose = known.prose if known else ""
 
-            def keep(prose: str | None) -> None:
-                """Reuse prior content, still normalizing a requirements region.
+        for title, current_evidence in node.synth_sections.items():
+            key = title.lower()
+            legacy_evidence, legacy_prose = legacy.get(key, ("", ""))
+            prior_prose = section_body(prior_text, title) or legacy_prose
+            recorded_evidence = prior_regions.get(key) or legacy_evidence
+            unchanged = bool(prior_prose) and recorded_evidence == current_evidence
+            fresh: str | None = None
 
-                Migration from the legacy prose format has to happen on the reuse path too: a
-                repo whose evidence never moves would otherwise keep its old shape forever.
-                """
-                if prose is None:
-                    return
-                resolved[region_id] = (reconcile(prose, index=anchor_index)
-                                       if region_id == REQUIREMENTS_REGION else prose)
+            if not unchanged:
+                if not can_generate:
+                    if not warned:
+                        on_log("warning: `claude` CLI not found — keeping existing prose, "
+                               "synthesized sections will not refresh.")
+                        warned = True
+                elif key not in _SECTION_RULES:
+                    pass  # not a section this module knows how to write
+                else:
+                    on_log(f"  synthesizing {node.path}:{key} …")
+                    fresh = _invoke(repo, _prompt(repo.name, key, evidence), model)
+                    if fresh is None:
+                        on_log(f"  warning: synthesis failed for {key}; keeping prior prose.")
+                    elif contains_heading_at_or_above(fresh, 2):
+                        # A `##` in the body would silently end the section and orphan whatever
+                        # follows — a failure the old comment delimiters could not produce.
+                        on_log(f"  warning: {key} synthesis emitted a section heading; "
+                               f"discarding it and keeping prior prose.")
+                        fresh = None
+                    else:
+                        regenerated.append(f"{node.path}:{key}")
 
-            if known and known.evidence == current_evidence and not known.is_placeholder():
-                keep(prior_prose)
-                continue
-            if not can_generate:
-                if not warned:
-                    on_log("warning: `claude` CLI not found — keeping existing prose, "
-                           "synthesized sections will not refresh.")
-                    warned = True
-                keep(prior_prose if known else None)
-                continue
-            on_log(f"  synthesizing {node.path}:{region_id} …")
-            body = _invoke(repo, _prompt(repo.name, region_id, evidence), model)
-            if body is None:
-                on_log(f"  warning: synthesis failed for {region_id}; keeping prior prose.")
-                keep(prior_prose if known else None)
-                continue
-            # Fresh description is merged into preserved intent rather than replacing it, so a
-            # promoted requirement is never lost to a re-synthesis.
-            resolved[region_id] = (reconcile(prior_prose, body, index=anchor_index)
-                                   if region_id == REQUIREMENTS_REGION else body)
-            regenerated.append(f"{node.path}:{region_id}")
+            if key == REQUIREMENTS_KEY:
+                # Records in, records out: merge fresh description into preserved intent, then
+                # re-hash. Authored requirements are never lost to a re-synthesis.
+                prior_records = hydrate(parse(prior_prose), prior_reqs)
+                merged = reconcile(prior_records, parse(fresh) if fresh else None, anchor_index)
+                resolved[title] = render_requirements(merged)
+                hashes_by_path.setdefault(node.path, {}).update(requirement_hashes(merged))
+            elif fresh is not None:
+                resolved[title] = fresh
+            elif prior_prose:
+                resolved[title] = prior_prose
+
         if resolved:
             prose_by_path[node.path] = resolved
 
-    return prose_by_path, regenerated
+    return prose_by_path, hashes_by_path, regenerated

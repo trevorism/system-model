@@ -5,26 +5,23 @@ an anchor naming the code it rests on. It is deliberately *not* a description of
 tables, dependency-injection lists and type signatures are all greppable, and a model made of them
 costs attention without repaying it.
 
-Each record carries machine-written metadata in an HTML comment, the same mechanism
-`core/overlay.py` uses for `intent:` and `synth:` regions:
+A record is plain Markdown, with nothing in it a reader has to be told to ignore:
 
-    <!-- req:R3 origin=authored anchors=4a1c2f09 state=verified -->
-    **R3.** Mutating endpoints require a signed app token, so a caller cannot reach data its own
-    credentials do not permit.
-    → `TimelineController.generate`, `SecureHttpClient`
-    <!-- /req -->
+    ### R2 — authored, verified
+    Role is derived, never requested: apps get system; users get user, escalating to tenant
+    admin or full admin only when the stored admin flag is set.
+    → `AccessTokenService.getRoleForIdentity`, `User.admin`
+    > Verified — derives every role claim server-side; no request model carries a role.
 
-Nothing in the header is hand-typed. A human edits the prose and flips `origin` to `authored`;
-the tool owns `anchors` and `state`.
+**Defaults are invisible.** A bare `### R1` means derived and unverified, which is almost every
+record; only a deviation is annotated. Machine state with no meaning to a reader — the anchor
+hash — lives in `MANIFEST.json` instead of cluttering the prose.
 
-**Origin decides lifetime.** `derived` records are descriptive — regenerated whenever synthesis
-re-runs. `authored` records are binding intent and survive regeneration untouched.
-
-**ID stability follows from that.** An authored ID is frozen at promotion and never reused, so a
-gate verdict or a change brief can reference it across runs. Derived IDs are positional and are
-reallocated on each re-synthesis into whatever numbers the authored ones aren't holding — there is
-no stable identity to preserve for prose that regenerates wholesale, and pretending otherwise
-would be a lie the reader could not check.
+**Origin decides lifetime.** `derived` records are description, regenerated whenever synthesis
+re-runs. `authored` records are binding intent and survive regeneration untouched. An authored id
+is frozen at promotion and never reused, so a gate verdict can cite `R3` across runs; derived ids
+are positional and get reallocated around the authored ones, because there is no stable identity
+to preserve for prose that regenerates wholesale.
 """
 from __future__ import annotations
 
@@ -33,9 +30,7 @@ from dataclasses import dataclass, field, replace
 
 from systemmodel.core.evidence import stable_hash
 
-# Synth regions with this id carry requirements, in any document. Phase 4's per-feature docs
-# reuse the same id, so the reconciliation below applies to them without further plumbing.
-REQUIREMENTS_REGION = "requirements"
+REQUIREMENTS_HEADING = "Requirements"
 
 AUTHORED = "authored"
 DERIVED = "derived"
@@ -46,15 +41,13 @@ VIOLATED = "violated"
 
 NO_HASH = "-"
 
-_BLOCK = re.compile(
-    r"<!-- req:(?P<id>R\d+)(?P<attrs>[^>]*?)-->\n(?P<inner>.*?)\n<!-- /req -->",
-    re.DOTALL,
-)
-_ATTR = re.compile(r"(\w+)=(\S+)")
-_LEGACY_SPLIT = re.compile(r"^R(\d+)\.[ \t]*", re.MULTILINE)
+STALE = "stale"
+UNANCHORED = "unanchored"
+
+_HEADING = re.compile(r"^###[ \t]+(?P<id>R\d+)[ \t]*(?:[—–-]+[ \t]*(?P<status>.+?))?[ \t]*$",
+                      re.MULTILINE)
 _ANCHOR_LINE = re.compile(r"^[ \t]*(?:->|→)[ \t]*(?P<anchors>.+)$", re.MULTILINE)
-_LEAD = re.compile(r"^\*\*R\d+\.\*\*[ \t]*")
-_FINDING = re.compile(r"^>[ \t]*\*\*(?:verified|violated)\*\*[ \t]*—[ \t]*(?P<finding>.+)$",
+_FINDING = re.compile(r"^>[ \t]*(?:Verified|Violated)[ \t]*[—–-]+[ \t]*(?P<finding>.+)$",
                       re.MULTILINE)
 # A capitalised type, optionally qualified, OR a bare camelCase member. The latter needs an
 # internal capital to qualify: feature-level anchors are routinely written as `fillInGaps` with
@@ -62,6 +55,16 @@ _FINDING = re.compile(r"^>[ \t]*\*\*(?:verified|violated)\*\*[ \t]*—[ \t]*(?P<
 _IDENTIFIER = re.compile(
     r"\b[A-Z][A-Za-z0-9]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?\b"
     r"|\b[a-z][a-zA-Z0-9]*[A-Z][A-Za-z0-9]*\b")
+
+# Legacy shapes, kept only so an older model on disk can be migrated forward without a
+# re-synthesis. Nothing writes either of these any more.
+_LEGACY_BLOCK = re.compile(
+    r"<!-- req:(?P<id>R\d+)(?P<attrs>[^>]*?)-->\n(?P<inner>.*?)\n<!-- /req -->", re.DOTALL)
+_LEGACY_ATTR = re.compile(r"(\w+)=(\S+)")
+_LEGACY_LEAD = re.compile(r"^\*\*R\d+\.\*\*[ \t]*")
+_LEGACY_FINDING = re.compile(r"^>[ \t]*\*\*(?:verified|violated)\*\*[ \t]*—[ \t]*(?P<f>.+)$",
+                             re.MULTILINE)
+_LEGACY_PROSE = re.compile(r"^R(\d+)\.[ \t]*", re.MULTILINE)
 
 
 @dataclass
@@ -75,6 +78,14 @@ class Requirement:
     finding: str | None = None
 
     @property
+    def number(self) -> int:
+        return int(self.id[1:])
+
+    @property
+    def is_authored(self) -> bool:
+        return self.origin == AUTHORED
+
+    @property
     def needs_verification(self) -> bool:
         """Authored intent whose verdict is missing. Derived description is never verified.
 
@@ -83,14 +94,6 @@ class Requirement:
         tracks how much intent you have committed to, not how large the model is.
         """
         return self.is_authored and self.state == UNVERIFIED
-
-    @property
-    def number(self) -> int:
-        return int(self.id[1:])
-
-    @property
-    def is_authored(self) -> bool:
-        return self.origin == AUTHORED
 
     def symbols(self) -> list[str]:
         """Identifier-shaped anchors, for resolution against an adapter's fact index.
@@ -104,22 +107,28 @@ class Requirement:
         for anchor in self.anchors:
             for token in _IDENTIFIER.findall(anchor):
                 # Emit the qualified form and its owning type, so an anchor written at member
-                # grain still resolves against an index that only knows the class. Anchors are
-                # prose; the index should meet them where they are rather than the reverse.
+                # grain still resolves against an index that only knows the class.
                 for candidate in (token, token.split(".", 1)[0]):
                     if candidate not in found:
                         found.append(candidate)
         return found
 
+    def status_words(self) -> list[str]:
+        """The annotations worth showing. Empty when the record is at its defaults."""
+        words = []
+        if self.origin != DERIVED:
+            words.append(self.origin)
+        if self.state != UNVERIFIED:
+            words.append(self.state)
+        return words
+
     def render(self) -> str:
-        header = (f"<!-- req:{self.id} origin={self.origin} "
-                  f"anchors={self.anchor_hash or NO_HASH} state={self.state} -->")
-        lines = [header, f"**{self.id}.** {self.body}".rstrip()]
+        status = ", ".join(self.status_words())
+        lines = [f"### {self.id}" + (f" — {status}" if status else ""), self.body]
         if self.anchors:
             lines.append("→ " + ", ".join(f"`{a}`" for a in self.anchors))
         if self.finding and self.state in (VERIFIED, VIOLATED):
-            lines.append(f"> **{self.state}** — {self.finding}")
-        lines.append("<!-- /req -->")
+            lines.append(f"> {self.state.capitalize()} — {self.finding}")
         return "\n".join(lines)
 
 
@@ -145,94 +154,96 @@ def _split_anchors(text: str) -> list[str]:
         else:
             current.append(ch)
     parts.append("".join(current))
-    # Backticks are markdown decoration, not part of the reference. Stripping all of them (not
-    # just a wrapping pair) keeps an anchor like ``Timeline.vue `item.employer`­`` from rendering
-    # as broken nested code spans when it is re-emitted.
-    cleaned = (p.replace("`", "").strip() for p in parts)
-    return [p for p in cleaned if p]
-
-
-def _split_body_and_anchors(chunk: str) -> tuple[str, list[str]]:
-    m = _ANCHOR_LINE.search(chunk)
-    if not m:
-        return _normalize_body(chunk), []
-    body = chunk[:m.start()]
-    return _normalize_body(body), _split_anchors(m.group("anchors"))
+    # Backticks are markdown decoration, not part of the reference.
+    return [p for p in (q.replace("`", "").strip() for q in parts) if p]
 
 
 def _normalize_body(text: str) -> str:
-    """Collapse a wrapped, indented prose block into one paragraph."""
+    """Collapse a wrapped prose block into one paragraph."""
     return " ".join(line.strip() for line in text.strip().splitlines() if line.strip())
 
 
-def parse_blocks(text: str) -> list[Requirement]:
-    """Requirements written in this module's own block format."""
+def _parse_status(raw: str | None) -> tuple[str, str]:
+    words = {w.strip().lower() for w in (raw or "").split(",") if w.strip()}
+    origin = AUTHORED if AUTHORED in words else DERIVED
+    state = VERIFIED if VERIFIED in words else VIOLATED if VIOLATED in words else UNVERIFIED
+    return origin, state
+
+
+def parse(text: str) -> list[Requirement]:
+    """Parse records from a section body, tolerating both retired on-disk formats."""
+    if "<!-- req:" in text:
+        return _parse_legacy_blocks(text)
+    headings = list(_HEADING.finditer(text))
+    if not headings:
+        return _parse_legacy_prose(text)
     found: list[Requirement] = []
-    for m in _BLOCK.finditer(text):
-        attrs = dict(_ATTR.findall(m.group("attrs") or ""))
-        inner = m.group("inner").strip()
-        finding_match = _FINDING.search(inner)
-        finding = finding_match.group("finding").strip() if finding_match else None
-        body, anchors = _split_body_and_anchors(
-            _LEAD.sub("", _FINDING.sub("", inner).strip()))
+    for position, heading in enumerate(headings):
+        end = headings[position + 1].start() if position + 1 < len(headings) else len(text)
+        chunk = text[heading.end():end]
+        origin, state = _parse_status(heading.group("status"))
+        finding_match = _FINDING.search(chunk)
+        anchor_match = _ANCHOR_LINE.search(chunk)
+        body_end = min(m.start() for m in (finding_match, anchor_match) if m) \
+            if (finding_match or anchor_match) else len(chunk)
         found.append(Requirement(
-            id=m.group("id"),
-            body=body,
-            anchors=anchors,
-            origin=attrs.get("origin", DERIVED),
-            anchor_hash=attrs.get("anchors", NO_HASH),
-            state=attrs.get("state", UNVERIFIED),
-            finding=finding,
+            id=heading.group("id"),
+            body=_normalize_body(chunk[:body_end]),
+            anchors=_split_anchors(anchor_match.group("anchors")) if anchor_match else [],
+            origin=origin,
+            state=state,
+            finding=finding_match.group("finding").strip() if finding_match else None,
         ))
     return found
 
 
-def parse_legacy(text: str) -> list[Requirement]:
-    """Requirements in the prose format synthesis has emitted so far (`R1. …` / `    -> …`).
+def _parse_legacy_blocks(text: str) -> list[Requirement]:
+    found: list[Requirement] = []
+    for m in _LEGACY_BLOCK.finditer(text):
+        attrs = dict(_LEGACY_ATTR.findall(m.group("attrs") or ""))
+        inner = m.group("inner").strip()
+        finding_match = _LEGACY_FINDING.search(inner)
+        stripped = _LEGACY_LEAD.sub("", _LEGACY_FINDING.sub("", inner).strip())
+        anchor_match = _ANCHOR_LINE.search(stripped)
+        body = stripped[:anchor_match.start()] if anchor_match else stripped
+        found.append(Requirement(
+            id=m.group("id"), body=_normalize_body(body),
+            anchors=_split_anchors(anchor_match.group("anchors")) if anchor_match else [],
+            origin=attrs.get("origin", DERIVED),
+            anchor_hash=attrs.get("anchors", NO_HASH),
+            state=attrs.get("state", UNVERIFIED),
+            finding=finding_match.group("f").strip() if finding_match else None,
+        ))
+    return found
 
-    This is the bootstrap path: 377 requirements already exist across the estate in this shape,
-    and they are good. Re-deriving them from scratch would discard synthesis work already paid
-    for and, worse, churn prose a human may already have come to rely on.
-    """
-    pieces = _LEGACY_SPLIT.split(text)
+
+def _parse_legacy_prose(text: str) -> list[Requirement]:
+    pieces = _LEGACY_PROSE.split(text)
     if len(pieces) < 3:
         return []
     found: list[Requirement] = []
     for number, chunk in zip(pieces[1::2], pieces[2::2]):
-        body, anchors = _split_body_and_anchors(chunk)
+        anchor_match = _ANCHOR_LINE.search(chunk)
+        body = _normalize_body(chunk[:anchor_match.start()] if anchor_match else chunk)
         if body:
-            found.append(Requirement(id=f"R{number}", body=body, anchors=anchors))
+            found.append(Requirement(
+                id=f"R{number}", body=body,
+                anchors=_split_anchors(anchor_match.group("anchors")) if anchor_match else []))
     return found
-
-
-def parse(text: str) -> list[Requirement]:
-    """Parse whichever format the text is in — blocks if present, else legacy prose."""
-    blocks = parse_blocks(text)
-    return blocks if blocks else parse_legacy(text)
-
-
-def update_in_text(text: str, updated: list[Requirement]) -> str:
-    """Rewrite matching requirement blocks in place, leaving everything else untouched.
-
-    Verification edits a verdict inside a document that also holds synthesized prose and possibly
-    hand-written intent; re-rendering the whole file would put both at risk for the sake of one
-    attribute.
-    """
-    by_id = {r.id: r for r in updated}
-
-    def replace_block(match: re.Match) -> str:
-        requirement = by_id.get(match.group("id"))
-        return requirement.render() if requirement else match.group(0)
-
-    return _BLOCK.sub(replace_block, text)
 
 
 def render(requirements: list[Requirement]) -> str:
     return "\n\n".join(r.render() for r in sorted(requirements, key=lambda r: r.number))
 
 
-STALE = "stale"
-UNANCHORED = "unanchored"
+def hashes(requirements: list[Requirement]) -> dict[str, str]:
+    """Anchor hashes for the manifest — the machine state kept out of the prose."""
+    return {r.id: r.anchor_hash for r in requirements if r.anchor_hash != NO_HASH}
+
+
+def hydrate(requirements: list[Requirement], recorded: dict[str, str]) -> list[Requirement]:
+    """Restore anchor hashes from the manifest onto records parsed from Markdown."""
+    return [replace(r, anchor_hash=recorded.get(r.id, r.anchor_hash)) for r in requirements]
 
 
 def hash_for(requirement: Requirement, index: dict[str, dict]) -> str:
@@ -244,8 +255,7 @@ def hash_for(requirement: Requirement, index: dict[str, dict]) -> str:
     """
     resolved = {name: index[name] for name in requirement.symbols() if name in index}
     # Where a member-grained anchor resolved, drop the whole-type fallback for that same type:
-    # keeping both would make an edit anywhere in the class mark this requirement stale, which
-    # is the coarseness the member index exists to remove. Anchors naming other types are kept.
+    # keeping both would make an edit anywhere in the class mark this requirement stale.
     refined = {name.split(".", 1)[0] for name in resolved if "." in name}
     kept = {name: facts for name, facts in resolved.items()
             if "." in name or name not in refined}
@@ -257,8 +267,7 @@ def apply_hashes(requirements: list[Requirement], index: dict[str, dict]) -> lis
 
     Without the demotion a re-derive would quietly re-baseline the hash and leave the record
     still claiming `verified` — so a change to the code underneath a binding guarantee would
-    erase its own evidence. Rebaselining is fine; rebaselining while keeping the old verdict is
-    not.
+    erase its own evidence.
     """
     updated: list[Requirement] = []
     for requirement in requirements:
@@ -269,11 +278,9 @@ def apply_hashes(requirements: list[Requirement], index: dict[str, dict]) -> lis
         moved = known and current != requirement.anchor_hash
         demote = moved and requirement.state in (VERIFIED, VIOLATED)
         updated.append(replace(
-            requirement,
-            anchor_hash=current,
+            requirement, anchor_hash=current,
             state=UNVERIFIED if demote else requirement.state,
-            # The finding described code that has since changed, so it is no longer evidence
-            # of anything. Keeping it would let a stale verdict masquerade as a current one.
+            # The finding described code that has since changed, so it is no longer evidence.
             finding=None if demote else requirement.finding,
         ))
     return updated
@@ -281,13 +288,7 @@ def apply_hashes(requirements: list[Requirement], index: dict[str, dict]) -> lis
 
 def staleness(requirements: list[Requirement],
               index: dict[str, dict]) -> list[tuple[Requirement, str]]:
-    """Requirements whose anchored code moved, or that anchor nothing resolvable.
-
-    `stale` means the obligation needs re-verification: the code beneath it changed, and whether
-    it still holds is now an open question. `unanchored` means it can never go stale, because
-    nothing it names could be resolved — worth surfacing separately, since a requirement nobody
-    can track is a gap in coverage rather than a change.
-    """
+    """Requirements whose anchored code moved, or that anchor nothing resolvable."""
     findings: list[tuple[Requirement, str]] = []
     for requirement in requirements:
         current = hash_for(requirement, index)
@@ -298,35 +299,12 @@ def staleness(requirements: list[Requirement],
     return findings
 
 
-def reconcile(prior_text: str, fresh_text: str | None = None,
-              index: dict[str, dict] | None = None) -> str:
-    """The text a requirements region should hold, given what was there and what synthesis made.
-
-    Called on every run, not only when synthesis fires, because it does double duty: with
-    `fresh_text` it merges new description into preserved intent, and without it, it normalizes
-    whatever is already on disk. That second case is what migrates the legacy `R1. …` prose into
-    records — a repo whose evidence never moves would otherwise never be converted.
-
-    Falls back to the original text when there is nothing parseable, so a region holding
-    something unexpected is left alone rather than blanked.
-    """
-    prior = parse(prior_text) if prior_text else []
-    fresh = parse(fresh_text) if fresh_text else []
-    if not prior and not fresh:
-        return fresh_text if fresh_text is not None else prior_text
-    merged = merge(prior, fresh)
-    if index is not None:
-        merged = apply_hashes(merged, index)
-    return render(merged)
-
-
 def merge(prior: list[Requirement], fresh: list[Requirement]) -> list[Requirement]:
     """Combine preserved authored intent with freshly synthesized description.
 
-    Authored records are kept verbatim and keep their IDs. Fresh derived records are renumbered
-    into the numbers the authored ones do not hold, in the order synthesis produced them. When
-    synthesis produced nothing, prior derived records are kept so a failed or skipped run never
-    silently empties the section.
+    Authored records are kept verbatim and keep their ids. Fresh derived records are renumbered
+    into the numbers the authored ones do not hold. When synthesis produced nothing, prior
+    derived records are kept so a failed or skipped run never silently empties the section.
     """
     authored = [r for r in prior if r.is_authored]
     if not fresh:
@@ -340,13 +318,13 @@ def merge(prior: list[Requirement], fresh: list[Requirement]) -> list[Requiremen
         while candidate in taken:
             candidate += 1
         taken.add(candidate)
-        renumbered.append(Requirement(
-            id=f"R{candidate}",
-            body=requirement.body,
-            anchors=requirement.anchors,
-            origin=DERIVED,
-            anchor_hash=requirement.anchor_hash,
-            state=requirement.state,
-        ))
+        renumbered.append(replace(requirement, id=f"R{candidate}", origin=DERIVED))
         candidate += 1
     return sorted(authored + renumbered, key=lambda r: r.number)
+
+
+def reconcile(prior: list[Requirement], fresh: list[Requirement] | None,
+              index: dict[str, dict] | None = None) -> list[Requirement]:
+    """Merge a fresh description into preserved intent and re-hash the result."""
+    merged = merge(prior, fresh or [])
+    return apply_hashes(merged, index) if index is not None else merged

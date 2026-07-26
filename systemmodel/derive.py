@@ -34,15 +34,17 @@ from systemmodel.core.config import (
     acknowledged_exposure, aggregate_kinds, authored_exceptions, authored_signals, feature_kinds,
 )
 from systemmodel.core.graph import service_graph
+from systemmodel.core.overlay import replace_section, section_body
+from systemmodel.core.render import INTENT_FILE, ensure_intent, recorded_decomposition
 from systemmodel.core.locate import dev_dir, model_root, platform_model_root, resolve_repo
 from systemmodel.core.platform import (
     aggregate, conformance, display_value as _disp, exception_lines, render_platform,
     trailing_conventions,
 )
-from systemmodel.core.render import read_manifest, render
+from systemmodel.core.render import read_manifest, recorded_state, render
 from systemmodel.core.requirements import (
-    UNANCHORED, VERIFIED, VIOLATED, Requirement, hash_for, parse_blocks, staleness,
-    update_in_text,
+    REQUIREMENTS_HEADING, UNANCHORED, VERIFIED, VIOLATED, Requirement, hash_for, hydrate,
+    parse, render as render_requirements, staleness,
 )
 from systemmodel.core.synth import decompose as synth_decompose
 from systemmodel.core.synth import verify as synth_verify
@@ -91,7 +93,8 @@ def _synthesize(repo: Path, adapter, nodes: list, args) -> tuple[dict, list[str]
     get_evidence = getattr(adapter, "extract_evidence", None)
     if not callable(get_evidence):
         return {}, []
-    return synth_resolve(repo, nodes, get_evidence(repo), model=args.model,
+    return synth_resolve(repo, nodes, get_evidence(repo),
+                         recorded=recorded_state(model_root(repo)), model=args.model,
                          anchor_index=_anchor_index(adapter, repo))
 
 
@@ -110,17 +113,37 @@ def _requirement_findings(repo: Path, adapter) -> tuple[list[str], int]:
         return [], 0
     stale_lines: list[str] = []
     unanchored = 0
-    for path in sorted(root.rglob("*.md")):
-        found = parse_blocks(path.read_text(encoding="utf-8"))
-        if not found:
-            continue
-        rel = path.relative_to(root).as_posix()
+    for rel, found in _model_requirements(root).items():
         for requirement, reason in staleness(found, index):
-            if reason == UNANCHORED:
-                unanchored += 1
-            else:
+            if reason != UNANCHORED:
                 stale_lines.append(f"{rel}:{requirement.id} stale (anchored code changed)")
+            elif requirement.is_authored:
+                # Binding intent that resolves to nothing is worse than untracked description:
+                # once verified it stays verified forever, whatever happens to the code.
+                stale_lines.append(f"{rel}:{requirement.id} is authored but anchors nothing "
+                                   f"resolvable — its verdict can never expire")
+            else:
+                unanchored += 1
     return stale_lines, unanchored
+
+
+def _model_requirements(root: Path) -> dict[str, list]:
+    """Every requirement in the model on disk, hydrated with its recorded anchor hash.
+
+    Records live in Markdown and their hashes in the manifest, so reading one without the other
+    would report every requirement as freshly unanchored.
+    """
+    state = recorded_state(root)
+    found: dict[str, list] = {}
+    for path in sorted(root.rglob("*.md")):
+        rel = path.relative_to(root).as_posix()
+        if rel == INTENT_FILE:
+            continue
+        section = section_body(path.read_text(encoding="utf-8"), REQUIREMENTS_HEADING)
+        records = hydrate(parse(section or ""), state.get(rel, {}).get("requirements", {}))
+        if records:
+            found[rel] = records
+    return found
 
 
 def _feature_layer(repo: Path, adapter, args, writing: bool) -> tuple[list, dict, list[str]]:
@@ -131,27 +154,29 @@ def _feature_layer(repo: Path, adapter, args, writing: bool) -> tuple[list, dict
     always agree on which files should exist, and a check never reports a feature as missing
     just because it did not run synthesis.
     """
+    root = model_root(repo)
     index = _anchor_index(adapter, repo)
     if not writing:
-        existing = features.load(model_root(repo))
+        existing = features.load(root, recorded_state(root))
         ordered = [existing[slug] for slug in sorted(existing)]
-        return features.nodes(ordered, index), {}, []
+        return features.nodes(ordered, index), {}, [], {}, recorded_decomposition(root)
 
     # Kinds outside the policy get no features, and any they already have are pruned. Without
     # this, deleting a template's features by hand is pointless — the next derive regenerates
     # them, and spends an agent call doing it.
     classify = getattr(adapter, "classify", None)
     if callable(classify) and classify(repo) not in feature_kinds():
-        return [], {}, []
+        return [], {}, [], {}, ""
 
     get_evidence = getattr(adapter, "extract_evidence", None)
     if not callable(get_evidence):
-        return [], {}, []
+        return [], {}, [], {}, ""
     resolved, stamp, regenerated = synth_decompose(
         repo, get_evidence(repo), index, model=args.model)
     return (features.nodes(resolved, index),
-            features.prose(resolved, stamp),
-            ["features"] if regenerated else [])
+            features.prose(resolved),
+            ["features"] if regenerated else [],
+            features.requirement_hashes(resolved), stamp)
 
 
 def _process_repo(repo: Path, args, generated_at: str) -> tuple[str, list[str], str]:
@@ -160,14 +185,18 @@ def _process_repo(repo: Path, args, generated_at: str) -> tuple[str, list[str], 
     nodes = extract_all(adapter, repo)
     mroot = model_root(repo)
     writing = not (args.dry_run or args.check)
-    prose, regenerated = _synthesize(repo, adapter, nodes, args) if writing else ({}, [])
-    feature_nodes, feature_prose, feature_regen = _feature_layer(repo, adapter, args, writing)
+    prose, req_hashes, regenerated = (_synthesize(repo, adapter, nodes, args) if writing
+                                      else ({}, {}, []))
+    feature_nodes, feature_prose, feature_regen, feature_hashes, stamp = _feature_layer(
+        repo, adapter, args, writing)
     nodes = nodes + feature_nodes
     prose = {**prose, **feature_prose}
+    req_hashes = {**req_hashes, **feature_hashes}
     regenerated = regenerated + feature_regen
     # --check never writes; it renders in dry-run to compute the new manifest + stale files.
     result = render(mroot, nodes, adapter=adapter.name, target=repo.name,
-                    generated_at=generated_at, dry_run=not writing, synth_prose=prose)
+                    generated_at=generated_at, dry_run=not writing, synth_prose=prose,
+                    requirement_hashes=req_hashes, decomposition=stamp)
     if args.check:
         drift = _drift(mroot, result.manifest, result.pruned)
         stale, unanchored = _requirement_findings(repo, adapter)
@@ -178,14 +207,16 @@ def _process_repo(repo: Path, args, generated_at: str) -> tuple[str, list[str], 
         # Unanchored requirements are a coverage gap to improve, not a change to react to, so
         # they are reported without failing the check.
         return ("drift" if (drift or stale) else "clean", detail, adapter.name)
-    detail = [f"[{n.level.value}] {n.path} ({n.content_hash()})" for n in nodes]
+    if ensure_intent(mroot, repo.name):
+        detail_intent = [f"created {INTENT_FILE} — write desired changes there, not in the "
+                         f"generated documents"]
+    else:
+        detail_intent = []
+    detail = detail_intent + [f"[{n.level.value}] {n.path} ({n.content_hash()})" for n in nodes]
     if regenerated:
         detail.append(f"re-synthesized: {', '.join(regenerated)}")
     if result.pruned:
         detail.append(f"pruned {len(result.pruned)}: {', '.join(result.pruned)}")
-    if result.dropped_authored:
-        detail.append(f"dropped authored intent (capability gone): "
-                      f"{', '.join(result.dropped_authored)}")
     return (("planned" if args.dry_run else "written"), detail, adapter.name)
 
 

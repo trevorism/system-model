@@ -1,122 +1,82 @@
-"""Overlay regions: content inside a derived doc that is not code-reconcilable.
+"""Sections: the parts of a generated document that hold non-code-reconcilable content.
 
-Two kinds share one mechanism, both anchored by invisible HTML comments:
+A model document is plain Markdown with `##` headings, and the tool owns some of those sections.
+There is deliberately no marker syntax — nothing a reader has to be told to ignore, and nothing
+that leaves them wondering whether a comment is load-bearing. A section is identified by its
+heading, and it runs until the next heading at the same or a higher level.
 
-    <!-- intent:<id> -->            human narrative; preserved forever, never regenerated
-    > intent: … prose …
-    <!-- /intent -->
+Two kinds of section content are not derived from code and so are excluded from the content hash
+(a prose edit must never read as drift):
 
-    <!-- synth:<id> evidence=<hash> -->   agent-synthesized prose; regenerated when the
-    … prose …                             evidence hash moves, reused verbatim when it doesn't
-    <!-- /synth -->
+  *synthesized* — written by an agent, regenerated when the facts beneath it move. Which facts,
+  and their hash, is recorded in `MANIFEST.json` rather than in the prose.
 
-Neither kind is code-truth, so both are normalized away in the *skeleton* — the form used for
-content hashing and for `--check` / `--apply` / `--gate` diffing. A prose edit is therefore never
-reported as drift. A synth region's `evidence` attribute IS kept in the skeleton: it is derived
-from code, so when the underlying facts move the doc legitimately counts as stale and the next
-derive re-synthesizes it.
+  *authored* — written by a human in `intent.md`, never regenerated, never overwritten.
+
+The skeleton used for hashing keeps the headings and blanks the bodies the tool does not derive,
+so `--check` compares structure and derived facts while ignoring prose.
 """
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 
-PLACEHOLDER = "> intent: _(unspecified)_"
-SYNTH_PLACEHOLDER = "_(not yet synthesized)_"
-
-_REGION = re.compile(
-    r"<!-- intent:(?P<id>[\w.\-:]+) -->\n(?P<inner>.*?)\n<!-- /intent -->",
-    re.DOTALL,
-)
-
-_SYNTH = re.compile(
-    r"<!-- synth:(?P<id>[\w.\-:]+)(?:\s+evidence=(?P<evidence>[0-9a-f]*))?\s*-->\n"
-    r"(?P<inner>.*?)\n<!-- /synth -->",
-    re.DOTALL,
-)
+_HEADING = re.compile(r"^(?P<hashes>#{1,6})[ \t]+(?P<title>.+?)[ \t]*$", re.MULTILINE)
 
 
-@dataclass(frozen=True)
-class SynthRegion:
-    evidence: str
-    prose: str
-
-    def is_placeholder(self) -> bool:
-        return self.prose.strip() == SYNTH_PLACEHOLDER
+def _slug(title: str) -> str:
+    return title.strip().lower()
 
 
-def _canonical(region_id: str) -> str:
-    return f"<!-- intent:{region_id} -->\n{PLACEHOLDER}\n<!-- /intent -->"
+def section_spans(text: str) -> list[tuple[str, int, int, int]]:
+    """`(title, level, body start, body end)` for every heading in the document."""
+    headings = list(_HEADING.finditer(text))
+    spans: list[tuple[str, int, int, int]] = []
+    for position, heading in enumerate(headings):
+        level = len(heading.group("hashes"))
+        end = len(text)
+        for later in headings[position + 1:]:
+            if len(later.group("hashes")) <= level:
+                end = later.start()
+                break
+        spans.append((heading.group("title").strip(), level, heading.end() + 1, end))
+    return spans
 
 
-def _canonical_synth(region_id: str, evidence: str) -> str:
-    anchor = f"<!-- synth:{region_id} evidence={evidence} -->" if evidence else f"<!-- synth:{region_id} -->"
-    return f"{anchor}\n{SYNTH_PLACEHOLDER}\n<!-- /synth -->"
+def section_body(text: str, title: str) -> str | None:
+    """The body under a `##`-level heading, or None when the document has no such section."""
+    for found, level, start, end in section_spans(text):
+        if level <= 2 and _slug(found) == _slug(title):
+            return text[start:end].strip("\n")
+    return None
 
 
-def synth_anchor(region_id: str, evidence: str) -> str:
-    return _canonical_synth(region_id, evidence)
+def replace_section(text: str, title: str, body: str) -> str:
+    """Swap the body under a heading, leaving the heading and the rest of the document alone."""
+    for found, level, start, end in section_spans(text):
+        if level <= 2 and _slug(found) == _slug(title):
+            trailing = "\n\n" if end < len(text) else "\n"
+            return text[:start] + body.strip("\n") + trailing + text[end:]
+    return text
 
 
-def is_placeholder(inner: str) -> bool:
-    return inner.strip() == PLACEHOLDER
+def blank_sections(text: str, titles) -> str:
+    """The skeleton for hashing: same headings, bodies of the named sections emptied.
+
+    Applied to both sides of every comparison, so prose that the tool does not derive — whether
+    an agent wrote it or a person did — can change freely without registering as drift.
+    """
+    wanted = {_slug(t) for t in titles}
+    for found, level, start, end in reversed(section_spans(text)):
+        if level <= 2 and _slug(found) in wanted:
+            text = text[:start] + text[end:]
+    return text
 
 
-def split_regions(text: str) -> tuple[str, dict[str, str], dict[str, SynthRegion]]:
-    authored: dict[str, str] = {}
-    synthesized: dict[str, SynthRegion] = {}
+def contains_heading_at_or_above(body: str, level: int) -> bool:
+    """True if prose would break out of a section of the given level.
 
-    def _replace_intent(m: re.Match) -> str:
-        rid, inner = m.group("id"), m.group("inner").strip()
-        if not is_placeholder(inner):
-            authored[rid] = inner
-        return _canonical(rid)
-
-    def _replace_synth(m: re.Match) -> str:
-        rid = m.group("id")
-        evidence = m.group("evidence") or ""
-        region = SynthRegion(evidence=evidence, prose=m.group("inner").strip())
-        if not region.is_placeholder():
-            synthesized[rid] = region
-        return _canonical_synth(rid, evidence)
-
-    skeleton = _SYNTH.sub(_replace_synth, text)
-    skeleton = _REGION.sub(_replace_intent, skeleton)
-    return skeleton, authored, synthesized
-
-
-def split_authored(text: str) -> tuple[str, dict[str, str]]:
-    skeleton, authored, _ = split_regions(text)
-    return skeleton, authored
-
-
-def merge_authored(derived_body: str, authored: dict[str, str]) -> str:
-    def _replace(m: re.Match) -> str:
-        rid = m.group("id")
-        prose = authored.get(rid)
-        if prose is None:
-            return m.group(0)
-        return f"<!-- intent:{rid} -->\n{prose}\n<!-- /intent -->"
-
-    return _REGION.sub(_replace, derived_body)
-
-
-def merge_synth(derived_body: str, prose_by_id: dict[str, str]) -> str:
-    def _replace(m: re.Match) -> str:
-        rid = m.group("id")
-        prose = prose_by_id.get(rid)
-        if prose is None:
-            return m.group(0)
-        evidence = m.group("evidence") or ""
-        anchor = f"<!-- synth:{rid} evidence={evidence} -->" if evidence else f"<!-- synth:{rid} -->"
-        return f"{anchor}\n{prose}\n<!-- /synth -->"
-
-    return _SYNTH.sub(_replace, derived_body)
-
-
-def region_ids(text: str) -> set[str]:
-    return {m.group("id") for m in _REGION.finditer(text)}
-
-
-def synth_requests(text: str) -> dict[str, str]:
-    return {m.group("id"): (m.group("evidence") or "") for m in _SYNTH.finditer(text)}
+    Synthesis is told to emit a section body and nothing else. If it emits a heading anyway, the
+    section silently ends early and everything after it is orphaned — a failure the old
+    comment-delimited form could not have. Cheaper to reject than to debug.
+    """
+    return any(len(m.group("hashes")) <= level for m in _HEADING.finditer(body))

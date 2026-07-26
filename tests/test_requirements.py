@@ -1,7 +1,7 @@
 """Requirement records: parsing both formats, round-tripping, and preserving authored intent."""
 from systemmodel.core.requirements import (
-    AUTHORED, DERIVED, NO_HASH, UNVERIFIED, VERIFIED, Requirement, merge, parse, parse_blocks,
-    parse_legacy, reconcile, render,
+    AUTHORED, DERIVED, NO_HASH, UNVERIFIED, VERIFIED, Requirement, hashes, hydrate, merge, parse,
+    reconcile, render,
 )
 
 LEGACY = """R1. Anyone on the internet may publish to any existing topic; only topic and subscription administration is gated, so the ingest path stays open to its eight consuming repos.
@@ -18,7 +18,7 @@ WRAPPED_LEGACY = """R1. Ownership is decided from the signed token, never from c
 
 
 def test_legacy_prose_parses_into_records():
-    reqs = parse_legacy(LEGACY)
+    reqs = parse(LEGACY)
     assert [r.id for r in reqs] == ["R1", "R2"]
     assert reqs[0].body.startswith("Anyone on the internet may publish")
     assert reqs[0].origin == DERIVED
@@ -27,7 +27,7 @@ def test_legacy_prose_parses_into_records():
 
 
 def test_anchor_line_is_split_but_not_inside_parens_or_quotes():
-    reqs = parse_legacy(LEGACY)
+    reqs = parse(LEGACY)
     assert reqs[0].anchors == [
         "EventController.sendEvent (no @Secure)",
         "SubscriptionController/TopicController @Secure(Roles.USER)",
@@ -37,29 +37,40 @@ def test_anchor_line_is_split_but_not_inside_parens_or_quotes():
 
 
 def test_a_wrapped_body_collapses_to_one_paragraph():
-    reqs = parse_legacy(WRAPPED_LEGACY)
+    reqs = parse(WRAPPED_LEGACY)
     assert "\n" not in reqs[0].body
     assert reqs[0].body.endswith("readable and writable by the browser.")
     assert reqs[0].anchors == ["ImageController.isOwnerOrAdmin", "Authentication"]
 
 
 def test_prose_with_no_requirements_yields_nothing():
-    assert parse_legacy("Just some paragraph that never numbers anything.") == []
+    assert parse("Just some paragraph that never numbers anything.") == []
 
 
-def test_blocks_round_trip_through_render_and_parse():
+def test_records_round_trip_through_render_and_parse():
+    """The prose carries everything except the anchor hash, which the manifest restores."""
     original = [
         Requirement(id="R1", body="First obligation.", anchors=["AController.go"],
-                    origin=AUTHORED, anchor_hash="4a1c2f09", state=VERIFIED),
+                    origin=AUTHORED, anchor_hash="4a1c2f09", state=VERIFIED,
+                    finding="Checked the handler."),
         Requirement(id="R2", body="Second obligation.", anchors=["BService"]),
     ]
-    reparsed = parse_blocks(render(original))
+    reparsed = hydrate(parse(render(original)), hashes(original))
     assert reparsed == original
+
+
+def test_a_record_at_its_defaults_carries_no_annotation():
+    """Almost every record is derived and unverified; only deviation is worth showing."""
+    plain = render([Requirement(id="R1", body="Just a description.", anchors=["X"])])
+    assert plain.splitlines()[0] == "### R1"
+
+    promoted = render([Requirement(id="R1", body="Binding.", origin=AUTHORED, state=VERIFIED)])
+    assert promoted.splitlines()[0] == "### R1 — authored, verified"
 
 
 def test_render_orders_numerically_not_lexically():
     reqs = [Requirement(id=f"R{n}", body=f"Body {n}.") for n in (10, 2, 1)]
-    assert [r.id for r in parse_blocks(render(reqs))] == ["R1", "R2", "R10"]
+    assert [r.id for r in parse(render(reqs))] == ["R1", "R2", "R10"]
 
 
 def test_parse_prefers_blocks_when_both_shapes_could_match():
@@ -121,29 +132,22 @@ def test_merge_marks_every_fresh_record_derived_even_if_it_claims_otherwise():
     assert merge([], fresh)[0].origin == DERIVED
 
 
-def test_reconcile_migrates_legacy_prose_with_no_synthesis():
-    migrated = reconcile(LEGACY)
-    assert "<!-- req:R1 origin=derived" in migrated
-    assert [r.id for r in parse_blocks(migrated)] == ["R1", "R2"]
+def test_legacy_prose_still_parses_so_an_old_model_can_migrate():
+    """Nothing writes this shape any more; reading it is what makes migration free."""
+    assert [r.id for r in parse(LEGACY)] == ["R1", "R2"]
 
 
-def test_reconcile_is_idempotent_once_migrated():
-    once = reconcile(LEGACY)
-    assert reconcile(once) == once
+def test_rendered_records_round_trip_through_the_new_format():
+    once = render(parse(LEGACY))
+    assert "<!--" not in once
+    assert render(parse(once)) == once
 
 
 def test_reconcile_keeps_authored_intent_when_synthesis_replaces_the_rest():
-    promoted = render([
-        Requirement(id="R1", body="Disposable.", ),
-        Requirement(id="R2", body="Binding.", origin=AUTHORED, state=VERIFIED),
-    ])
-    result = parse_blocks(reconcile(promoted, LEGACY))
+    prior = [Requirement(id="R1", body="Disposable."),
+             Requirement(id="R2", body="Binding.", origin=AUTHORED, state=VERIFIED)]
+    result = reconcile(prior, parse(LEGACY))
     held = [r for r in result if r.is_authored]
     assert [(r.id, r.body, r.state) for r in held] == [("R2", "Binding.", VERIFIED)]
     assert "Disposable." not in [r.body for r in result]
     assert len(result) == 3  # the held one plus both freshly synthesized
-
-
-def test_reconcile_leaves_unparseable_content_alone_rather_than_blanking_it():
-    prose = "Some section body that is not requirements at all."
-    assert reconcile(prose) == prose

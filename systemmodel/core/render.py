@@ -1,18 +1,25 @@
 """Render Nodes to a model doc tree + MANIFEST.json.
 
-System-agnostic: it writes whatever Nodes an adapter produced, wrapping each in the
-frontmatter envelope and recording provenance + content hash in the manifest. The caller
-decides the output root (a repo's model dir, or the platform root); this module just writes
-there and prunes only the files it previously wrote.
+System-agnostic: it writes whatever Nodes an adapter produced, wrapping each in the frontmatter
+envelope and recording provenance, content hash and section state in the manifest. The caller
+decides the output root (a repo's model dir, or the platform root); this module just writes there
+and prunes only the files it previously wrote.
+
+Generated documents are wholly generated. Human writing lives in `intent.md`, which this module
+never writes and never prunes — so there is no preserved-region machinery here, and nothing in a
+generated file that a reader has to treat as load-bearing.
 """
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from systemmodel.core.overlay import merge_authored, merge_synth, region_ids, split_authored
+from systemmodel.core.overlay import replace_section
 from systemmodel.core.schema import GENERATOR_VERSION, Node, frontmatter
+
+INTENT_FILE = "intent.md"
 
 
 @dataclass
@@ -22,11 +29,6 @@ class RenderResult:
     manifest: dict
     dry_run: bool
     pruned: list[str]
-    dropped_authored: list[str] = None  # type: ignore[assignment]
-
-    def __post_init__(self):
-        if self.dropped_authored is None:
-            self.dropped_authored = []
 
 
 def read_manifest(root: Path) -> dict | None:
@@ -40,43 +42,56 @@ def read_manifest(root: Path) -> dict | None:
         return None
 
 
-def _document(node: Node, *, adapter: str, body: str | None = None) -> str:
-    fm = frontmatter(node, adapter=adapter)
-    text = (body if body is not None else node.body).rstrip("\n")
-    return f"{fm}\n\n{text}\n"
+def recorded_state(root: Path) -> dict[str, dict]:
+    """Per-document machine state from the manifest: evidence and anchor hashes.
 
-
-def _authored_body(node: Node, root: Path, synth_prose: dict[str, str] | None) -> tuple[str, list[str]]:
-    """Compose an overlay-supporting node's file body from derived content plus preserved prose.
-
-    Recovers authored regions from the node's prior on-disk file and re-injects them into the
-    freshly derived body, then layers on any synthesized prose the caller resolved. Returns
-    `(body, dropped)` where `dropped` are region ids the prior file had authored prose for but
-    that this derivation no longer produces (their capability is gone). The node's
-    `body`/`content_hash` are unchanged — only the *written* file carries the prose.
+    This is what used to sit in HTML comments inside the prose. It has no meaning to a reader,
+    so it lives here instead — but the tool still needs it to decide what to regenerate and what
+    has gone stale.
     """
+    manifest = read_manifest(root) or {}
+    return {n["path"]: {"regions": n.get("regions", {}),
+                        "requirements": n.get("requirements", {})}
+            for n in manifest.get("nodes", []) if "path" in n}
+
+
+def _document(node: Node, *, adapter: str, prose: dict[str, str] | None) -> str:
     body = node.body
-    prior = root / node.path
-    if prior.is_file():
-        _, authored = split_authored(prior.read_text(encoding="utf-8"))
-        if authored:
-            # No empty intent slots are emitted — a placeholder nobody fills is just noise in
-            # every doc. So a preserved region usually has no anchor to merge into: re-attach
-            # it at the end rather than silently discarding someone's prose.
-            present = region_ids(node.body)
-            body = merge_authored(body, {k: v for k, v in authored.items() if k in present})
-            for rid, prose in sorted(authored.items()):
-                if rid not in present:
-                    body = (body.rstrip("\n")
-                            + f"\n\n<!-- intent:{rid} -->\n{prose}\n<!-- /intent -->\n")
-    if synth_prose:
-        body = merge_synth(body, synth_prose)
-    return body, []
+    for title, text in (prose or {}).items():
+        body = replace_section(body, title, text)
+    return f"{frontmatter(node, adapter=adapter)}\n\n{body.rstrip()}\n"
 
 
-def build_manifest(nodes: list[Node], *, adapter: str, target: str, generated_at: str) -> dict:
+_LEGACY_STAMP = re.compile(r"<!-- decomposition evidence=([0-9a-f]*) -->")
+
+
+def recorded_decomposition(root: Path) -> str:
+    """The evidence the on-disk feature decomposition was built from.
+
+    A repo-level fact, so it lives once at the manifest root rather than being repeated in every
+    feature document — which is also what stops a re-derive from re-cutting the features for free.
+
+    Falls back to the stamp's retired inline home. Without that, migrating a model written before
+    the manifest carried it would re-cut the features of every repo, at one agent call each, for
+    no reason other than the bookkeeping having moved.
+    """
+    stamp = (read_manifest(root) or {}).get("decomposition", "")
+    if stamp:
+        return stamp
+    for path in sorted((root / "features").glob("*.md")):
+        found = _LEGACY_STAMP.search(path.read_text(encoding="utf-8"))
+        if found:
+            return found.group(1)
+    return ""
+
+
+def build_manifest(nodes: list[Node], *, adapter: str, target: str, generated_at: str,
+                   requirement_hashes: dict[str, dict[str, str]] | None = None,
+                   decomposition: str = "") -> dict:
+    hashes = requirement_hashes or {}
     return {
-        "schema": "systemmodel/manifest@1",
+        "schema": "systemmodel/manifest@2",
+        "decomposition": decomposition,
         "generator_version": GENERATOR_VERSION,
         "adapter": adapter,
         "target": target,
@@ -90,6 +105,10 @@ def build_manifest(nodes: list[Node], *, adapter: str, target: str, generated_at
                 "status": n.status,
                 "content_hash": n.content_hash(),
                 "derived_from": n.derived_from,
+                # Lower-cased: the section title is the key everywhere it is looked up,
+                # and a case mismatch here silently re-synthesizes on every run.
+                "regions": {k.lower(): v for k, v in n.synth_sections.items()},
+                "requirements": hashes.get(n.path, {}),
             }
             for n in nodes
         ],
@@ -105,41 +124,31 @@ def render(
     generated_at: str,
     dry_run: bool = False,
     synth_prose: dict[str, dict[str, str]] | None = None,
+    requirement_hashes: dict[str, dict[str, str]] | None = None,
+    decomposition: str = "",
 ) -> RenderResult:
     """Write the model tree into `out_root` (or preview if dry_run).
 
-    `target` is recorded in the manifest. Pruning is manifest-driven: only files this model
-    wrote on a previous run (per the on-disk MANIFEST.json) are removed. Unrelated files —
-    e.g. platform.toml or sibling repo subdirs sharing the standalone root — are never touched.
+    Pruning is manifest-driven: only files this model wrote on a previous run are removed, so
+    `intent.md`, `platform.toml` and sibling repo subdirs sharing the root are never touched.
     """
     root = out_root
-    manifest = build_manifest(
-        nodes, adapter=adapter, target=target, generated_at=generated_at
-    )
+    manifest = build_manifest(nodes, adapter=adapter, target=target,
+                              generated_at=generated_at, requirement_hashes=requirement_hashes,
+                              decomposition=decomposition)
 
-    documents: dict[str, str] = {}
-    dropped_authored: list[str] = []
-    for node in nodes:
-        if node.supports_authored:
-            body, dropped = _authored_body(node, root, (synth_prose or {}).get(node.path))
-            documents[node.path] = _document(node, adapter=adapter, body=body)
-            dropped_authored.extend(f"{node.path}:{rid}" for rid in dropped)
-        else:
-            documents[node.path] = _document(node, adapter=adapter)
+    documents = {n.path: _document(n, adapter=adapter, prose=(synth_prose or {}).get(n.path))
+                 for n in nodes}
     documents["MANIFEST.json"] = json.dumps(manifest, indent=2) + "\n"
 
-    # Prune only what a previous run recorded in the manifest and this run no longer
-    # produces, so the tree matches the manifest without scanning (or deleting) anything
-    # else that happens to live under a shared root.
     old = read_manifest(root)
     previous = [n["path"] for n in old.get("nodes", [])] + ["MANIFEST.json"] if old else []
-    pruned = sorted(p for p in previous if p not in documents)
+    pruned = sorted(p for p in previous if p not in documents and p != INTENT_FILE)
     if not dry_run:
         for rel in pruned:
             dest = root / rel
             if dest.is_file():
                 dest.unlink()
-            # Remove now-empty parent dirs left behind (deepest first, up to the root).
             parent = dest.parent
             while parent != root and parent.is_dir():
                 try:
@@ -158,5 +167,34 @@ def render(
         dest.write_text(content, encoding="utf-8", newline="\n")
 
     return RenderResult(root=root, files=written, manifest=manifest,
-                        dry_run=dry_run, pruned=pruned,
-                        dropped_authored=sorted(dropped_authored))
+                        dry_run=dry_run, pruned=pruned)
+
+
+INTENT_TEMPLATE = """# Intent — {repo}
+
+Write here in plain prose. Nothing in this file is generated, and a re-derive never touches it.
+
+Use it to ask for changes to the model or to the code:
+
+- a new obligation this repo must meet
+- a change to an existing requirement (name it, e.g. "R3 should also cover service accounts")
+- a requirement to retire, and why
+- a requirement to promote to binding intent
+
+`--intake` turns entries here into proper requirement records — allocating the id, resolving the
+anchors, and filing it under the right document — so there is no block syntax to learn and no way
+to put one in the wrong place.
+
+## Desired updates
+
+"""
+
+
+def ensure_intent(root, repo_name: str) -> bool:
+    """Create the human-owned file if it is missing. Never overwrites an existing one."""
+    target = root / INTENT_FILE
+    if target.exists():
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(INTENT_TEMPLATE.format(repo=repo_name), encoding="utf-8", newline="\n")
+    return True

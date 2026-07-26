@@ -63,8 +63,9 @@ def test_unknown_repo_yields_nothing():
 def _model_with(tmp_path: Path, monkeypatch, requirement: Requirement | None) -> Path:
     import systemmodel.core.apply as apply_mod
     monkeypatch.setattr(apply_mod, "model_root", lambda repo: tmp_path)
-    body = render([requirement]) if requirement else "# overview\n"
-    (tmp_path / "overview.md").write_text(body, encoding="utf-8")
+    records = render([requirement]) if requirement else ""
+    (tmp_path / "overview.md").write_text(
+        "\n".join(["# overview", "", "## Requirements", "", records, ""]), encoding="utf-8")
     return tmp_path
 
 

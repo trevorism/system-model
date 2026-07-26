@@ -21,13 +21,14 @@ from __future__ import annotations
 import re
 
 from systemmodel.core.evidence import stable_hash
-from systemmodel.core.overlay import synth_anchor
+from systemmodel.core.overlay import section_body
 from systemmodel.core.requirements import (
-    Requirement, apply_hashes, hash_for, merge, parse, parse_blocks, render,
+    REQUIREMENTS_HEADING, Requirement, apply_hashes, hash_for, hydrate, merge, parse,
+    render,
 )
 from systemmodel.core.schema import Level, Node
 
-FEATURE_REGION = "feature"
+SUMMARY_HEADING = "Summary"
 
 _DIR = "features"
 # The separator may be an em/en dash or one or two hyphens — the prompt asks for `--`, but an
@@ -36,7 +37,6 @@ _HEADING = re.compile(
     r"^##[ \t]+(?P<slug>[a-z0-9][a-z0-9-]*?)[ \t]+(?:[—–]|-{1,2})[ \t]+(?P<title>.+?)[ \t]*$"
     r"|^##[ \t]+(?P<bare>[a-z0-9][a-z0-9-]*)[ \t]*$",
     re.MULTILINE)
-_TITLE_LINE = re.compile(r"^#[ \t]+(?P<title>.+)$", re.MULTILINE)
 _UNPROPOSED = "> _No longer proposed by the latest decomposition — keep it or delete the file._"
 _SLUG_SAFE = re.compile(r"[^a-z0-9-]+")
 
@@ -68,45 +68,58 @@ class Feature:
         """Hash of everything this feature's requirements rest on — its re-synthesis trigger."""
         return stable_hash(sorted(hash_for(r, index) for r in self.requirements))
 
-    def body(self, stamp: str = "") -> str:
-        """The synthesized payload: what actually lands inside the doc's region.
-
-        The decomposition stamp rides in here rather than in the node skeleton so it stays out
-        of the content hash — otherwise every code change would drift every feature document.
-        """
-        lines = []
-        if stamp:
-            lines += [f"<!-- decomposition evidence={stamp} -->", ""]
-        lines += [f"# {self.title}", ""]
+    def summary(self) -> str:
+        """The prose filling the Summary section: the human title, then what it is for."""
+        lines = [f"**{self.title}**", ""]
         if not self.proposed:
             lines += [_UNPROPOSED, ""]
         if self.purpose:
-            lines += [self.purpose, ""]
-        if self.requirements:
-            lines += ["## Requirements", "", render(self.requirements), ""]
-        return "\n".join(lines).rstrip() + "\n"
+            lines.append(self.purpose)
+        return "\n".join(lines).strip()
 
 
 def parse_body(text: str) -> Feature | None:
     """Recover a feature from a rendered document, so prior state can be preserved."""
-    title_match = _TITLE_LINE.search(text)
-    if not title_match:
+    summary = section_body(text, SUMMARY_HEADING)
+    requirements_text = section_body(text, REQUIREMENTS_HEADING)
+    if summary is None and requirements_text is None:
         return None
-    requirements = parse_blocks(text)
-    after_title = text[title_match.end():]
-    purpose_lines = []
-    for line in after_title.splitlines():
+    if summary is None:
+        # Written before Summary existed: the title was an H1 and the purpose the prose under it.
+        summary = "\n".join(_legacy_summary(text))
+    title, purpose = "", ""
+    for line in (summary or "").splitlines():
         stripped = line.strip()
         if not stripped or stripped == _UNPROPOSED:
             continue
-        if stripped.startswith(("#", "<!--")):
-            break
-        purpose_lines.append(stripped)
+        if not title and stripped.startswith("**"):
+            title = stripped.strip("*").strip()
+        else:
+            purpose = (purpose + " " + stripped).strip()
     return Feature(
-        slug="", title=title_match.group("title").strip(),
-        purpose=" ".join(purpose_lines), requirements=requirements,
-        proposed=_UNPROPOSED not in text,
+        slug="", title=title, purpose=purpose,
+        requirements=parse(requirements_text or ""),
+        proposed=_UNPROPOSED not in (summary or ""),
     )
+
+
+def _legacy_summary(text: str) -> list[str]:
+    """Title and purpose from a document written before Summary existed.
+
+    Frontmatter has to be skipped explicitly: it sits above the title and none of its lines look
+    like a heading, so a naive scan folds `level: L2` and friends into the purpose.
+    """
+    lines: list[str] = []
+    body = text.split("---\n", 2)[-1] if text.startswith("---") else text
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            lines.append(f"**{stripped[2:].strip()}**")
+        elif stripped.startswith("## "):
+            break
+        elif stripped and not stripped.startswith("<!--"):
+            lines.append(stripped)
+    return lines
 
 
 def parse_decomposition(text: str) -> list[Feature]:
@@ -131,16 +144,20 @@ def parse_decomposition(text: str) -> list[Feature]:
     return features
 
 
-def load(model_root) -> dict[str, Feature]:
+def load(model_root, recorded: dict[str, dict] | None = None) -> dict[str, Feature]:
     """Features already on disk, keyed by slug. The node set is derived from this."""
     directory = model_root / _DIR
     if not directory.is_dir():
         return {}
+    state = recorded or {}
     found: dict[str, Feature] = {}
     for path in sorted(directory.glob("*.md")):
         feature = parse_body(path.read_text(encoding="utf-8"))
         if feature:
             feature.slug = path.stem
+            feature.requirements = hydrate(
+                feature.requirements,
+                state.get(feature.path, {}).get("requirements", {}))
             found[feature.slug] = feature
     return found
 
@@ -172,17 +189,29 @@ def reconcile(prior: dict[str, Feature], fresh: list[Feature],
 
 
 def nodes(features: list[Feature], index: dict[str, dict]) -> list[Node]:
-    """One L2 node per feature. The body is a skeleton; the prose arrives as an overlay."""
-    # The skeleton is only the anchor: the title is synthesized, so emitting one here too would
-    # put two H1s in every document. It also means a feature's content hash tracks exactly one
-    # thing — whether the code its requirements rest on has moved.
+    """One L2 node per feature: a stable heading skeleton the prose is poured into.
+
+    The H1 is the slug, not the synthesized title — the slug is the identity, and keeping the
+    title out of the skeleton means a reworded title is not drift. `synth_sections` records the
+    evidence each section rests on, so a feature document goes stale exactly when the code its
+    requirements rest on moves.
+    """
     return [
         Node(Level.L2, "feature", f.slug, f.path,
-             synth_anchor(FEATURE_REGION, f.evidence(index)) + "\n",
-             supports_authored=True)
+             "\n".join([f"# Feature: {f.slug}", "",
+                        f"## {SUMMARY_HEADING}", "",
+                        f"## {REQUIREMENTS_HEADING}", ""]),
+             synth_sections={SUMMARY_HEADING: f.evidence(index),
+                             REQUIREMENTS_HEADING: f.evidence(index)})
         for f in features
     ]
 
 
-def prose(features: list[Feature], stamp: str = "") -> dict[str, dict[str, str]]:
-    return {f.path: {FEATURE_REGION: f.body(stamp)} for f in features}
+def prose(features: list[Feature]) -> dict[str, dict[str, str]]:
+    return {f.path: {SUMMARY_HEADING: f.summary(),
+                     REQUIREMENTS_HEADING: render(f.requirements)} for f in features}
+
+
+def requirement_hashes(features: list[Feature]) -> dict[str, dict[str, str]]:
+    from systemmodel.core.requirements import hashes
+    return {f.path: hashes(f.requirements) for f in features}

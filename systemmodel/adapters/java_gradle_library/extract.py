@@ -24,7 +24,6 @@ from systemmodel.core.evidence import Evidence, stable_hash
 from systemmodel.core.filters import iter_files, read_text, significant_source
 from systemmodel.core.graph import service_graph
 from systemmodel.core.members import index_unique_members, member_spans
-from systemmodel.core.overlay import synth_anchor
 from systemmodel.core.schema import Level, Node
 
 _TREVORISM_HOST = re.compile(r"https://([a-z0-9.-]+\.trevorism\.com)")
@@ -227,10 +226,9 @@ def _md_overview(repo: Path, artifact: dict, wiring: dict, types: list[JavaType]
     if artifact.get("version"):
         identity.append(f"v{artifact['version']}")
     lines = [f"# {artifact['name']}", "", " · ".join(identity), "",
-             synth_anchor("purpose", evidence_hashes.get("purpose", "")), ""]
+             "## Purpose", ""]
 
-    lines += ["## Requirements", "",
-              synth_anchor("requirements", evidence_hashes.get("requirements", "")), ""]
+    lines += ["## Requirements", ""]
 
     lines += ["## Wiring", ""]
     calls = " · ".join(wiring["calls"]) or "_(nothing outbound)_"
@@ -394,7 +392,9 @@ class JavaGradleLibraryAdapter:
         return Node(
             level=Level.L1, kind="overview", id="overview", path="overview.md",
             body=_md_overview(repo, artifact, wiring, types, _consumers(repo), hashes),
-            derived_from=provenance, supports_authored=True,
+            derived_from=provenance,
+            synth_sections={"Purpose": hashes.get("purpose", ""),
+                            "Requirements": hashes.get("requirements", "")},
         )
 
     def anchor_facts(self, repo: Path) -> dict:
