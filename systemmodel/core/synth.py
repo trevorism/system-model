@@ -145,6 +145,43 @@ Rules:
 _SECTION_RULES = {"purpose": _PURPOSE_RULES, "requirements": _REQUIREMENTS_RULES,
                   "features": _FEATURES_RULES}
 
+
+_INTAKE_PROMPT = """A human has written requests against the system model for `{repo}`, in prose.
+Turn each into one concrete change to a requirement record.
+
+THE REQUESTS:
+{entries}
+
+THE MODEL'S CURRENT REQUIREMENTS:
+{inventory}
+
+For each request emit exactly one block. Use no other text.
+
+## ENTRY <n>
+ACTION: add|amend|retire|promote
+DOCUMENT: <path exactly as listed above, e.g. features/token-issuance.md>
+TARGET: <the requirement id, for amend/retire/promote only>
+BODY: <one sentence, <=30 words, for add/amend only>
+ANCHORS: <comma-separated real class, member or host names, for add/amend only>
+
+Choosing the action:
+- `add` when the request describes an obligation the model does not yet state.
+- `amend` when it changes the wording or scope of an existing one. Restate the WHOLE sentence,
+  not the delta.
+- `retire` when it says a requirement no longer applies.
+- `promote` when it asks to make an existing requirement binding without changing what it says.
+
+Choosing the document: put an obligation with the feature it belongs to; use overview.md only for
+something that spans the whole service. If the request names a feature or a requirement id, honour
+it. Never invent a document that is not in the list.
+
+Anchors are what makes a requirement checkable, so read the code and name the real symbols the
+obligation rests on. Prefer `Type.member` when one member carries it. Do not guess: if you cannot
+find the code, say so in a NOTE line and emit no ACTION for that entry.
+
+Requests you cannot map to exactly one change: emit `## ENTRY <n>` with only a NOTE line saying
+why. It will be left in the inbox for the human."""
+
 _VERIFY_PROMPT = """You are checking whether the repo `{repo}` SATISFIES one authored requirement.
 
 This is a human-written obligation the system is supposed to meet. Your job is to find out
@@ -383,3 +420,27 @@ def resolve(repo: Path, nodes: list[Node], evidence: Evidence, *,
             prose_by_path[node.path] = resolved
 
     return prose_by_path, hashes_by_path, regenerated
+
+
+def plan_intake(repo: Path, entries: list[str], inventory: str, *,
+                model: str | None = None, on_log=print):
+    """Ask an agent to turn prose requests into concrete record changes.
+
+    One call for the whole inbox, not one per entry: the requests are read against a shared
+    inventory and often relate to each other, and per-entry calls would multiply cost for a
+    worse answer.
+    """
+    from systemmodel.core.intake import parse_plan
+
+    if not entries:
+        return []
+    if not available():
+        on_log("warning: `claude` CLI not found — cannot process intent.md.")
+        return []
+    numbered = "\n".join(f"{n}. {e}" for n, e in enumerate(entries, 1))
+    raw = _invoke(repo, _INTAKE_PROMPT.format(repo=repo.name, entries=numbered,
+                                              inventory=inventory), model)
+    if raw is None:
+        on_log("  warning: intake planning failed; intent.md left untouched.")
+        return []
+    return parse_plan(raw)

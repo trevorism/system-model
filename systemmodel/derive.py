@@ -7,6 +7,7 @@
     uv run systemmodel --platform          # L0 platform model -> $SYSTEMMODEL_DIR/ (root)
     uv run systemmodel <repo> --apply      # spec -> code: emit a change brief from the edited model
     uv run systemmodel <repo> --auto       # spec -> code: drive an agent from the brief, then verify
+    uv run systemmodel <repo> --intake     # turn prose in intent.md into requirement records
     uv run systemmodel <repo> --verify     # ask an agent whether the code meets each authored requirement
     uv run systemmodel <repo> --gate       # conformance: exit 1 if code violates authored intent
     uv run systemmodel --all --gate        # conformance across all repos (CI gate)
@@ -34,6 +35,7 @@ from systemmodel.core.config import (
     acknowledged_exposure, aggregate_kinds, authored_exceptions, authored_signals, feature_kinds,
 )
 from systemmodel.core.graph import service_graph
+from systemmodel.core.intake import INBOX_HEADING, apply_to_document, clear_inbox, read_inbox
 from systemmodel.core.overlay import replace_section, section_body
 from systemmodel.core.render import INTENT_FILE, ensure_intent, recorded_decomposition
 from systemmodel.core.locate import dev_dir, model_root, platform_model_root, resolve_repo
@@ -47,6 +49,7 @@ from systemmodel.core.requirements import (
     parse, render as render_requirements, staleness,
 )
 from systemmodel.core.synth import decompose as synth_decompose
+from systemmodel.core.synth import plan_intake as synth_plan_intake
 from systemmodel.core.synth import verify as synth_verify
 from systemmodel.core.synth import resolve as synth_resolve
 
@@ -253,6 +256,70 @@ def _verification_targets(repo: Path, adapter) -> list[tuple[str, Requirement]]:
     return targets
 
 
+def _inventory(root: Path) -> str:
+    """What the model already states, so the planner can target a record instead of inventing one."""
+    lines: list[str] = []
+    for rel, records in sorted(_model_requirements(root).items()):
+        lines.append(f"{rel}:")
+        for r in records:
+            mark = " [authored]" if r.is_authored else ""
+            lines.append(f"  {r.id}{mark}: {r.body}")
+    return "\n".join(lines) or "(no requirements yet)"
+
+
+def _intake_repo(repo: Path, args, generated_at: str) -> int:
+    """Apply the prose in intent.md, then re-derive so the records are hashed and consistent."""
+    try:
+        adapter = adapters.select(repo, args.adapter)
+    except LookupError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    root = model_root(repo)
+    intent_path = root / INTENT_FILE
+    if not intent_path.is_file():
+        print(f"error: no {INTENT_FILE} at {root}; run `uv run systemmodel {repo.name}` first",
+              file=sys.stderr)
+        return 2
+
+    intent = intent_path.read_text(encoding="utf-8")
+    entries = read_inbox(intent)
+    if not entries:
+        print(f"{repo.name}: nothing under '{INBOX_HEADING}' in {INTENT_FILE}")
+        return 0
+
+    print(f"{repo.name}: {len(entries)} request(s) in {INTENT_FILE}")
+    changes = synth_plan_intake(repo, entries, _inventory(root), model=args.model)
+    if not changes:
+        print("  nothing actionable was planned; intent.md left as it is")
+        return 1
+
+    by_document: dict[str, list] = {}
+    for change in changes:
+        by_document.setdefault(change.document, []).append(change)
+
+    applied: list[str] = []
+    for rel, document_changes in sorted(by_document.items()):
+        target = root / rel
+        if not target.is_file():
+            applied.append(f"skipped — no such document {rel}")
+            continue
+        updated, log = apply_to_document(target.read_text(encoding="utf-8"), document_changes)
+        target.write_text(updated, encoding="utf-8", newline="\n")
+        applied += log
+
+    for line in applied:
+        print(f"  {line}")
+    intent_path.write_text(clear_inbox(intent, applied, generated_at), encoding="utf-8",
+                           newline="\n")
+
+    # Re-derive so the new records get their anchor hashes and the manifest agrees with the
+    # documents. Free: no evidence moved, so nothing re-synthesizes.
+    _process_repo(repo, args, generated_at)
+    print(f"\n{repo.name}: {len(applied)} change(s) applied; "
+          f"run --verify to check the authored ones against the code")
+    return 0
+
+
 def _verify_repo(repo: Path, args) -> int:
     """Check each authored requirement against the code and record the verdict."""
     try:
@@ -291,10 +358,15 @@ def _verify_repo(repo: Path, args) -> int:
         updates.setdefault(path, []).append(
             replace(requirement, state=state, finding=finding))
 
-    for path, requirements in updates.items():
+    for path, verdicts in updates.items():
         target = root / path
-        target.write_text(update_in_text(target.read_text(encoding="utf-8"), requirements),
-                          encoding="utf-8", newline="\n")
+        text = target.read_text(encoding="utf-8")
+        judged = {r.id: r for r in verdicts}
+        merged = [judged.get(r.id, r)
+                  for r in parse(section_body(text, REQUIREMENTS_HEADING) or "")]
+        target.write_text(
+            replace_section(text, REQUIREMENTS_HEADING, render_requirements(merged)),
+            encoding="utf-8", newline="\n")
 
     checked = sum(len(v) for v in updates.values())
     print(f"\n{repo.name}: {checked} verified, {violated} violated, {unclear} unclear")
@@ -484,6 +556,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="print the plan without writing")
     parser.add_argument("--check", action="store_true",
                         help="report drift vs the checked-in model without writing; exit 1 if stale")
+    parser.add_argument("--intake", action="store_true",
+                        help="turn the prose in the repo's intent.md into requirement records, "
+                             "then re-derive")
     parser.add_argument("--verify", action="store_true",
                         help="check each authored requirement against the code with an agent and "
                              "record the verdict; exit 1 if any is violated")
@@ -531,6 +606,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--verify works on a single repo (agent calls are per requirement)")
     if args.verify and not args.repo:
         parser.error("--verify requires a repo name")
+    if args.intake and (args.all or args.platform):
+        parser.error("--intake works on a single repo (intent.md is per repo)")
+    if args.intake and not args.repo:
+        parser.error("--intake requires a repo name")
     if args.verify and (args.check or args.gate or args.apply or args.auto):
         parser.error("--verify records verdicts; --check/--gate/--apply/--auto read them — run each")
     if args.gate and args.apply:
@@ -601,6 +680,9 @@ def main(argv: list[str] | None = None) -> int:
     if not repo.exists():
         print(f"error: repo path does not exist: {repo}", file=sys.stderr)
         return 2
+
+    if args.intake:
+        return _intake_repo(repo, args, generated_at)
 
     if args.verify:
         return _verify_repo(repo, args)
