@@ -133,3 +133,15 @@ def test_prose_is_keyed_by_document_path():
     sections = payload["features/employment-gap-marking.md"]
     assert "Career Gap Detection" in sections["Summary"]
     assert parse(sections["Requirements"])[0].anchors == ["fillInGaps", "GAP_THRESHOLD_DAYS"]
+
+
+def test_keeping_existing_features_does_not_clone_promotions(tmp_path: Path):
+    """`merge` treats its fresh argument as new description; prior records are not that."""
+    from systemmodel.core.features import keep_existing
+    prior = {"f": Feature("f", "Title", "purpose", [
+        Requirement(id="R1", body="Described."),
+        Requirement(id="R2", body="Binding.", origin=AUTHORED, state=VERIFIED)])}
+
+    kept = keep_existing(prior, INDEX)[0]
+
+    assert [(r.id, r.origin) for r in kept.requirements] == [("R1", "derived"), ("R2", AUTHORED)]

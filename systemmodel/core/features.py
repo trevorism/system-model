@@ -162,6 +162,18 @@ def load(model_root, recorded: dict[str, dict] | None = None) -> dict[str, Featu
     return found
 
 
+def keep_existing(prior: dict[str, Feature], index: dict[str, dict]) -> list[Feature]:
+    """Re-hash what is already on disk, merging nothing.
+
+    Not the same as reconciling against itself. `merge` treats its `fresh` argument as newly
+    synthesized description, so feeding it the prior records preserves each authored one *and*
+    re-adds it renumbered as a derived copy — a duplicate per run, forever.
+    """
+    return [Feature(slug=f.slug, title=f.title, purpose=f.purpose,
+                    requirements=apply_hashes(f.requirements, index), proposed=f.proposed)
+            for _, f in sorted(prior.items())]
+
+
 def reconcile(prior: dict[str, Feature], fresh: list[Feature],
               index: dict[str, dict]) -> list[Feature]:
     """Merge a fresh decomposition into what exists, preserving slugs and authored intent."""

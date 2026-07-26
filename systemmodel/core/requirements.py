@@ -311,6 +311,12 @@ def merge(prior: list[Requirement], fresh: list[Requirement]) -> list[Requiremen
         return sorted(authored + [r for r in prior if not r.is_authored],
                       key=lambda r: r.number)
 
+    # A fresh record restating a preserved authored one is dropped, not renumbered alongside it.
+    # Synthesis is told not to restate, but a caller passing the prior records back in as `fresh`
+    # would otherwise clone every promotion on every run — silently, and once per derive.
+    held = {r.body.strip() for r in authored}
+    fresh = [r for r in fresh if r.body.strip() not in held]
+
     taken = {r.number for r in authored}
     renumbered: list[Requirement] = []
     candidate = 1

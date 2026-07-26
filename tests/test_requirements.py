@@ -151,3 +151,14 @@ def test_reconcile_keeps_authored_intent_when_synthesis_replaces_the_rest():
     assert [(r.id, r.body, r.state) for r in held] == [("R2", "Binding.", VERIFIED)]
     assert "Disposable." not in [r.body for r in result]
     assert len(result) == 3  # the held one plus both freshly synthesized
+
+
+def test_a_fresh_record_restating_authored_intent_is_dropped_not_cloned():
+    """Re-running a no-op derive must not add a derived copy of every promotion."""
+    promoted = Requirement(id="R2", body="Binding intent.", origin=AUTHORED, state=VERIFIED)
+    prior = [Requirement(id="R1", body="Description."), promoted]
+
+    merged = merge(prior, list(prior))  # the shape the decompose keep-path used to pass
+
+    assert [r.body for r in merged].count("Binding intent.") == 1
+    assert len([r for r in merged if r.is_authored]) == 1

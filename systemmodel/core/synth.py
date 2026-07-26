@@ -300,7 +300,8 @@ def decompose(repo: Path, evidence: Evidence, index: dict[str, dict], *,
     the agent has to read the whole repo to cut it sensibly either way, so per-feature calls
     would multiply cost by the branching factor and buy nothing.
     """
-    from systemmodel.core.features import load, parse_decomposition, reconcile
+    from systemmodel.core.features import (
+        keep_existing, load, parse_decomposition, reconcile)
 
     prior = load(model_root(repo))
     stamp = evidence.section_hash("requirements")
@@ -308,7 +309,7 @@ def decompose(repo: Path, evidence: Evidence, index: dict[str, dict], *,
     def keep(reason: str | None = None) -> tuple[list, str, bool]:
         if reason:
             on_log(reason)
-        return reconcile(prior, list(prior.values()), index), stamp, False
+        return keep_existing(prior, index), stamp, False
 
     if prior and recorded_decomposition(model_root(repo)) == stamp:
         return keep()
