@@ -6,7 +6,7 @@ ones the code does not meet.
 
 This used to diff whole documents. That could not work: one fact was projected into several
 sections a human had to keep consistent by hand, so doing exactly what a brief asked still left
-`--check` dirty, and the next brief asked for the change to be undone. A requirement is one
+`--compare` dirty, and the next brief asked for the change to be undone. A requirement is one
 obligation in one place, and acceptance is a verdict on the code rather than a text match, so
 neither failure is reachable from here.
 
@@ -58,7 +58,7 @@ def requirement_gaps(repo: Path) -> list[tuple[str, Requirement]]:
     """Authored requirements the code does not meet, or has not been checked against.
 
     An unverified obligation counts as a gap: intent nobody has confirmed is not evidence the
-    system holds, and treating it as passing would let `--gate` go green on an unchecked claim.
+    system holds, and treating it as passing would let `--enforce` go green on an unchecked claim.
     """
     return [(path, requirement) for path, requirement in authored_requirements(repo)
             if requirement.state in (VIOLATED, UNVERIFIED)]

@@ -129,3 +129,36 @@ def test_intent_is_never_pruned(tmp_path: Path):
 
     assert INTENT_FILE not in result.pruned
     assert intent.read_text(encoding="utf-8") == "- make the thing require auth\n"
+
+
+def test_an_untouched_intent_file_is_refreshed(tmp_path: Path):
+    """Boilerplate can improve later without a hand migration."""
+    from systemmodel.core.render import ensure_intent
+    stale = tmp_path / INTENT_FILE
+    stale.write_text("# Intent — svc\n\nPages of old instructions.\n\n## Desired updates\n\n",
+                     encoding="utf-8")
+
+    assert ensure_intent(tmp_path, "svc") is True
+    assert "Pages of old instructions." not in stale.read_text(encoding="utf-8")
+
+
+def test_intent_a_human_has_written_in_is_never_clobbered(tmp_path: Path):
+    from systemmodel.core.render import ensure_intent
+    written = tmp_path / INTENT_FILE
+    body = "# Intent — svc\n\n## Desired updates\n\n- callers must be authenticated\n"
+    written.write_text(body, encoding="utf-8")
+
+    assert ensure_intent(tmp_path, "svc") is False
+    assert written.read_text(encoding="utf-8") == body
+
+
+def test_intent_with_applied_history_is_never_clobbered(tmp_path: Path):
+    """An empty inbox does not mean unused — the history is the evidence it was used."""
+    from systemmodel.core.render import ensure_intent
+    written = tmp_path / INTENT_FILE
+    body = ("# Intent — svc\n\n## Desired updates\n\n"
+            "## Applied\n\n### 2026-01-01\n- promoted R2\n")
+    written.write_text(body, encoding="utf-8")
+
+    assert ensure_intent(tmp_path, "svc") is False
+    assert written.read_text(encoding="utf-8") == body

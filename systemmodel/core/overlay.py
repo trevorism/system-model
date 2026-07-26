@@ -14,7 +14,7 @@ Two kinds of section content are not derived from code and so are excluded from 
   *authored* — written by a human in `intent.md`, never regenerated, never overwritten.
 
 The skeleton used for hashing keeps the headings and blanks the bodies the tool does not derive,
-so `--check` compares structure and derived facts while ignoring prose.
+so `--compare` compares structure and derived facts while ignoring prose.
 """
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ def replace_section(text: str, title: str, body: str) -> str:
     for found, level, start, end in section_spans(text):
         if level <= 2 and _slug(found) == _slug(title):
             trailing = "\n\n" if end < len(text) else "\n"
-            return text[:start] + body.strip("\n") + trailing + text[end:]
+            return text[:start] + "\n" + body.strip("\n") + trailing + text[end:]
     return text
 
 
@@ -80,3 +80,16 @@ def contains_heading_at_or_above(body: str, level: int) -> bool:
     comment-delimited form could not have. Cheaper to reject than to debug.
     """
     return any(len(m.group("hashes")) <= level for m in _HEADING.finditer(body))
+
+
+def drop_section(text: str, title: str) -> str:
+    """Remove a heading and its body entirely.
+
+    An empty section is worse than an absent one: it invites the reader to wonder what should
+    have been there. Sections that have nothing to say are not written.
+    """
+    for found, level, start, end in section_spans(text):
+        if level <= 2 and _slug(found) == _slug(title):
+            heading = text.rfind("\n#", 0, start)
+            return text[:heading + 1 if heading >= 0 else 0] + text[end:]
+    return text

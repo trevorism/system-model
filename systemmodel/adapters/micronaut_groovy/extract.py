@@ -791,12 +791,11 @@ def _md_overview(repo: Path, f: dict, wiring: dict, risks: list[str], evidence_h
         lines.append(f"- **libs** → {', '.join(wiring['shared_libraries'])}")
     lines.append("")
 
-    lines += ["## Watch out", ""]
+    # Only when there is something to watch: 52 of 54 repos had nothing, and a section whose
+    # content is "nothing flagged" teaches the reader to skip the one that some day isn't.
     if risks:
-        lines += [f"- {note}" for note in risks]
-    else:
-        lines.append("_Nothing flagged: no unauthenticated writes outside auth flows._")
-    lines.append("")
+        lines += ["## Watch out", ""] + [f"- {note}" for note in risks] + [""]
+    lines += ["## Features", ""]
     return "\n".join(lines)
 
 

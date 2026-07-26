@@ -1,17 +1,17 @@
 """CLI: derive a system model for a target repo and write it to the standalone model dir.
 
     uv run systemmodel <repo> [--dry-run] [--adapter NAME]   # -> $SYSTEMMODEL_DIR/<repo>/
-    uv run systemmodel <repo> --check      # drift check, no writes, exit 1 if stale
+    uv run systemmodel <repo> --compare      # drift check, no writes, exit 1 if stale
     uv run systemmodel --all               # every auto-detected repo in the container
-    uv run systemmodel --all --check       # platform-wide staleness check (CI)
+    uv run systemmodel --all --compare       # platform-wide staleness check (CI)
     uv run systemmodel --platform          # L0 platform model -> $SYSTEMMODEL_DIR/ (root)
-    uv run systemmodel <repo> --apply      # spec -> code: emit a change brief from the edited model
-    uv run systemmodel <repo> --auto       # spec -> code: drive an agent from the brief, then verify
-    uv run systemmodel <repo> --intake     # turn prose in intent.md into requirement records
+    uv run systemmodel <repo> --brief      # emit a change brief for unmet authored requirements
+    uv run systemmodel <repo> --remediate  # drive an agent from that brief, then re-verify
+    uv run systemmodel <repo> --adopt     # turn prose in intent.md into requirement records
     uv run systemmodel <repo> --verify     # ask an agent whether the code meets each authored requirement
-    uv run systemmodel <repo> --gate       # conformance: exit 1 if code violates authored intent
-    uv run systemmodel --all --gate        # conformance across all repos (CI gate)
-    uv run systemmodel --platform --gate   # conformance: exit 1 if platform.toml requirements violated
+    uv run systemmodel <repo> --enforce       # conformance: exit 1 if code violates authored intent
+    uv run systemmodel --all --enforce        # conformance across all repos (CI gate)
+    uv run systemmodel --platform --enforce   # conformance: exit 1 if platform.toml requirements violated
 
 (equivalently: python -m systemmodel.derive ...)
 
@@ -36,7 +36,7 @@ from systemmodel.core.config import (
 )
 from systemmodel.core.graph import service_graph
 from systemmodel.core.intake import INBOX_HEADING, apply_to_document, clear_inbox, read_inbox
-from systemmodel.core.overlay import replace_section, section_body
+from systemmodel.core.overlay import drop_section, replace_section, section_body
 from systemmodel.core.render import INTENT_FILE, ensure_intent, recorded_decomposition
 from systemmodel.core.locate import dev_dir, model_root, platform_model_root, resolve_repo
 from systemmodel.core.platform import (
@@ -91,7 +91,7 @@ def _anchor_index(adapter, repo: Path) -> dict:
 
 
 def _synthesize(repo: Path, adapter, nodes: list, args) -> tuple[dict, list[str]]:
-    """Resolve synthesized prose for a writing derive. Never called by --check/--gate/--dry-run,
+    """Resolve synthesized prose for a writing derive. Never called by --compare/--enforce/--dry-run,
     which reconcile the skeleton and so must stay free, offline and deterministic."""
     get_evidence = getattr(adapter, "extract_evidence", None)
     if not callable(get_evidence):
@@ -106,7 +106,7 @@ def _requirement_findings(repo: Path, adapter) -> tuple[list[str], int]:
 
     Free and offline: it compares the anchor hash each requirement recorded against the one its
     anchors resolve to now. Once the structural docs stop being rendered this is the *only* thing
-    that notices a code change, so it is what `--check` reports instead of a file-level hash.
+    that notices a code change, so it is what `--compare` reports instead of a file-level hash.
     """
     root = model_root(repo)
     if not root.exists():
@@ -153,7 +153,7 @@ def _feature_layer(repo: Path, adapter, args, writing: bool) -> tuple[list, dict
     """Feature nodes and their prose.
 
     When writing, the decomposition is resolved (one agent call, only if the code moved). When
-    not, the node set is rebuilt from the documents already on disk — so `--check` and a write
+    not, the node set is rebuilt from the documents already on disk — so `--compare` and a write
     always agree on which files should exist, and a check never reports a feature as missing
     just because it did not run synthesis.
     """
@@ -162,7 +162,8 @@ def _feature_layer(repo: Path, adapter, args, writing: bool) -> tuple[list, dict
     if not writing:
         existing = features.load(root, recorded_state(root))
         ordered = [existing[slug] for slug in sorted(existing)]
-        return features.nodes(ordered, index), {}, [], {}, recorded_decomposition(root)
+        return (features.nodes(ordered, index), features.prose(ordered), [], {},
+                recorded_decomposition(root))
 
     # Kinds outside the policy get no features, and any they already have are pruned. Without
     # this, deleting a template's features by hand is pointless — the next derive regenerates
@@ -182,25 +183,46 @@ def _feature_layer(repo: Path, adapter, args, writing: bool) -> tuple[list, dict
             features.requirement_hashes(resolved), stamp)
 
 
+def _link_features(nodes: list, feature_nodes: list, feature_prose: dict) -> None:
+    """Give the overview an index of its features, in place.
+
+    Built here rather than in the adapter because the decomposition is resolved after extraction;
+    the same list is used whether it came from a fresh decomposition or from disk, so a check and
+    a write never disagree. The index is derived content, so it belongs in the hashed body.
+    """
+    overview = next((n for n in nodes if n.id == "overview"), None)
+    if overview is None:
+        return
+    entries = []
+    for node in feature_nodes:
+        summary = feature_prose.get(node.path, {}).get(features.SUMMARY_HEADING, "")
+        title = next((line.strip().strip("*") for line in summary.splitlines()
+                      if line.strip().startswith("**")), node.id)
+        entries.append(f"- [{node.id}]({node.path}) — {title}")
+    overview.body = (replace_section(overview.body, "Features", "\n".join(entries))
+                     if entries else drop_section(overview.body, "Features"))
+
+
 def _process_repo(repo: Path, args, generated_at: str) -> tuple[str, list[str], str]:
     """Derive one repo. Returns (status, detail_lines, adapter_name)."""
     adapter = adapters.select(repo, args.adapter)
     nodes = extract_all(adapter, repo)
     mroot = model_root(repo)
-    writing = not (args.dry_run or args.check)
+    writing = not (args.dry_run or args.compare)
     prose, req_hashes, regenerated = (_synthesize(repo, adapter, nodes, args) if writing
                                       else ({}, {}, []))
     feature_nodes, feature_prose, feature_regen, feature_hashes, stamp = _feature_layer(
         repo, adapter, args, writing)
+    _link_features(nodes, feature_nodes, feature_prose)
     nodes = nodes + feature_nodes
     prose = {**prose, **feature_prose}
     req_hashes = {**req_hashes, **feature_hashes}
     regenerated = regenerated + feature_regen
-    # --check never writes; it renders in dry-run to compute the new manifest + stale files.
+    # --compare never writes; it renders in dry-run to compute the new manifest + stale files.
     result = render(mroot, nodes, adapter=adapter.name, target=repo.name,
                     generated_at=generated_at, dry_run=not writing, synth_prose=prose,
                     requirement_hashes=req_hashes, decomposition=stamp)
-    if args.check:
+    if args.compare:
         drift = _drift(mroot, result.manifest, result.pruned)
         stale, unanchored = _requirement_findings(repo, adapter)
         detail = drift + stale
@@ -416,7 +438,7 @@ def _apply_repo(repo: Path, args) -> int:
     if not root.exists():
         print(f"error: no model at {root}\n"
               f"       run `uv run systemmodel {repo.name}` first, then promote a requirement to "
-              f"`origin=authored` and re-run --apply.", file=sys.stderr)
+              f"`origin=authored` and re-run --brief.", file=sys.stderr)
         return 2
     try:
         adapters.select(repo, args.adapter)
@@ -487,7 +509,7 @@ def _derive_platform(args, generated_at: str) -> int:
     aggs = aggregate(records, specs, authored_signals(), authored_exceptions())
 
     # Conformance gate: measure code against authored platform.toml requirements; write nothing.
-    if args.gate:
+    if args.enforce:
         conf = conformance(aggs)
         excused = exception_lines(conf)
         if not conf.required:
@@ -517,9 +539,9 @@ def _derive_platform(args, generated_at: str) -> int:
                             acknowledged=acknowledged_exposure())
     root = platform_model_root()
     result = render(root, nodes, adapter="+".join(sorted(adapters_used)), target="platform",
-                    generated_at=generated_at, dry_run=args.dry_run or args.check)
+                    generated_at=generated_at, dry_run=args.dry_run or args.compare)
 
-    if args.check:
+    if args.compare:
         drift = _drift(root, result.manifest, result.pruned)
         if drift:
             print(f"DRIFT - platform model stale vs {len(repos_used)} repos:")
@@ -554,30 +576,30 @@ def main(argv: list[str] | None = None) -> int:
                         help="derive the L0 platform model into the standalone model root from all repos")
     parser.add_argument("--adapter", help="force a specific adapter instead of auto-detect")
     parser.add_argument("--dry-run", action="store_true", help="print the plan without writing")
-    parser.add_argument("--check", action="store_true",
+    parser.add_argument("--compare", action="store_true",
                         help="report drift vs the checked-in model without writing; exit 1 if stale")
-    parser.add_argument("--intake", action="store_true",
+    parser.add_argument("--adopt", action="store_true",
                         help="turn the prose in the repo's intent.md into requirement records, "
                              "then re-derive")
     parser.add_argument("--verify", action="store_true",
                         help="check each authored requirement against the code with an agent and "
                              "record the verdict; exit 1 if any is violated")
-    parser.add_argument("--gate", action="store_true",
-                        help="conformance gate: exit 1 if code violates authored intent — a repo's "
-                             "edited spec (repo/--all) or platform.toml requirements (--platform). "
-                             "Report only; writes nothing")
-    parser.add_argument("--apply", action="store_true",
-                        help="spec -> code: diff the edited on-disk model against the code and emit "
-                             "a change brief (does not edit code)")
-    parser.add_argument("--auto", action="store_true",
-                        help="spec -> code: drive the claude CLI from the change brief to edit the "
-                             "repo, then re-derive to verify (loops until --check clean)")
+    parser.add_argument("--enforce", action="store_true",
+                        help="exit 1 if any authored requirement is violated or unverified "
+                             "(repo/--all), or a platform.toml requirement is broken (--platform). "
+                             "Free, offline, writes nothing")
+    parser.add_argument("--brief", action="store_true",
+                        help="emit a change brief for the authored requirements the code does not "
+                             "meet (does not edit code)")
+    parser.add_argument("--remediate", action="store_true",
+                        help="drive the claude CLI from the change brief, then re-derive and "
+                             "re-verify (loops until every authored requirement holds)")
     parser.add_argument("--max-iters", type=int, default=3,
-                        help="--auto: max agent iterations before giving up (default 3)")
+                        help="--remediate: max agent iterations before giving up (default 3)")
     parser.add_argument("--dangerous", action="store_true",
-                        help="--auto: run the agent with --dangerously-skip-permissions instead of "
+                        help="--remediate: run the agent with --dangerously-skip-permissions instead of "
                              "acceptEdits (lets it run Bash/tests, but can run anything)")
-    parser.add_argument("--model", help="--auto: model for the spawned claude agent")
+    parser.add_argument("--model", help="--remediate: model for the spawned claude agent")
     args = parser.parse_args(argv)
 
     if not args.all and not args.repo and not args.platform:
@@ -586,44 +608,44 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--platform stands alone (not with a repo or --all)")
     if args.all and args.repo:
         parser.error("use either a repo name or --all, not both")
-    if args.apply and (args.all or args.platform):
-        parser.error("--apply works on a single repo (not with --all/--platform)")
-    if args.apply and args.check:
-        parser.error("--apply (spec->code) and --check (code->model) are opposite directions; use one")
-    if args.apply and not args.repo:
-        parser.error("--apply requires a repo name")
-    if args.auto and (args.all or args.platform):
-        parser.error("--auto works on a single repo (not with --all/--platform)")
-    if args.auto and args.check:
-        parser.error("--auto (spec->code) and --check (code->model) are opposite directions; use one")
-    if args.auto and args.apply:
-        parser.error("--auto drives an agent from the brief; --apply only emits it — use one")
-    if args.auto and not args.repo:
-        parser.error("--auto requires a repo name")
-    if args.gate and args.check:
-        parser.error("--check (staleness) and --gate (conformance) are separate checks; run each")
+    if args.brief and (args.all or args.platform):
+        parser.error("--brief works on a single repo (not with --all/--platform)")
+    if args.brief and args.compare:
+        parser.error("--brief (spec->code) and --compare (code->model) are opposite directions; use one")
+    if args.brief and not args.repo:
+        parser.error("--brief requires a repo name")
+    if args.remediate and (args.all or args.platform):
+        parser.error("--remediate works on a single repo (not with --all/--platform)")
+    if args.remediate and args.compare:
+        parser.error("--remediate (spec->code) and --compare (code->model) are opposite directions; use one")
+    if args.remediate and args.brief:
+        parser.error("--remediate drives an agent from the brief; --brief only emits it — use one")
+    if args.remediate and not args.repo:
+        parser.error("--remediate requires a repo name")
+    if args.enforce and args.compare:
+        parser.error("--compare (staleness) and --enforce (conformance) are separate checks; run each")
     if args.verify and (args.all or args.platform):
         parser.error("--verify works on a single repo (agent calls are per requirement)")
     if args.verify and not args.repo:
         parser.error("--verify requires a repo name")
-    if args.intake and (args.all or args.platform):
-        parser.error("--intake works on a single repo (intent.md is per repo)")
-    if args.intake and not args.repo:
-        parser.error("--intake requires a repo name")
-    if args.verify and (args.check or args.gate or args.apply or args.auto):
-        parser.error("--verify records verdicts; --check/--gate/--apply/--auto read them — run each")
-    if args.gate and args.apply:
-        parser.error("--apply emits the change brief; --gate checks the same gap with an exit code — use one")
-    if args.gate and args.auto:
-        parser.error("--auto drives an agent to close the gap; --gate only checks it — use one")
+    if args.adopt and (args.all or args.platform):
+        parser.error("--adopt works on a single repo (intent.md is per repo)")
+    if args.adopt and not args.repo:
+        parser.error("--adopt requires a repo name")
+    if args.verify and (args.compare or args.enforce or args.brief or args.remediate):
+        parser.error("--verify records verdicts; --compare/--enforce/--brief/--remediate read them — run each")
+    if args.enforce and args.brief:
+        parser.error("--brief emits the change brief; --enforce checks the same gap with an exit code — use one")
+    if args.enforce and args.remediate:
+        parser.error("--remediate drives an agent to close the gap; --enforce only checks it — use one")
 
     generated_at = datetime.now().isoformat(timespec="seconds")
 
     if args.platform:
         return _derive_platform(args, generated_at)
 
-    # ---- batch: --all --gate ----
-    if args.all and args.gate:
+    # ---- batch: --all --enforce ----
+    if args.all and args.enforce:
         violated = skipped = errored = checked = 0
         for repo in _candidate_repos():
             try:
@@ -666,10 +688,10 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"  {repo.name:24} {status}")
         print(f"\n{derived} processed, {skipped} skipped (no adapter), {errored} errored"
-              + (f", {drifted} drifted" if args.check else ""))
+              + (f", {drifted} drifted" if args.compare else ""))
         # Fail the run on any error (a repo that couldn't be derived/verified) or, in
-        # --check mode, on any drift — so CI can't go green on a partial/stale result.
-        return 1 if (errored or (args.check and drifted)) else 0
+        # --compare mode, on any drift — so CI can't go green on a partial/stale result.
+        return 1 if (errored or (args.compare and drifted)) else 0
 
     # ---- single repo ----
     try:
@@ -681,13 +703,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: repo path does not exist: {repo}", file=sys.stderr)
         return 2
 
-    if args.intake:
+    if args.adopt:
         return _intake_repo(repo, args, generated_at)
 
     if args.verify:
         return _verify_repo(repo, args)
 
-    if args.gate:
+    if args.enforce:
         try:
             paths = _gate_repo(repo, args)
         except LookupError as e:
@@ -695,15 +717,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if paths:
             print(f"VIOLATION - {repo.name}: unmet authored requirement(s): {', '.join(paths)}")
-            print(f"run: uv run systemmodel {repo.name} --apply   (for the change brief)")
+            print(f"run: uv run systemmodel {repo.name} --brief   (for the change brief)")
             return 1
         print(f"clean - {repo.name} meets every authored requirement")
         return 0
 
-    if args.apply:
+    if args.brief:
         return _apply_repo(repo, args)
 
-    if args.auto:
+    if args.remediate:
         try:
             adapter = adapters.select(repo, args.adapter)
         except LookupError as e:
@@ -722,7 +744,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     mroot = model_root(repo)
-    if args.check:
+    if args.compare:
         if status == "drift":
             print(f"DRIFT - {mroot} is stale vs code:")
             for line in detail:

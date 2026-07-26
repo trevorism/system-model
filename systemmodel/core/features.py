@@ -13,7 +13,7 @@ factor for no extra fidelity, since the agent has to understand the whole repo e
 **Sticky slugs.** Decomposition is non-deterministic, so a naive re-run would rename and re-cut
 features on every pass and the tree would churn beyond recognition. A slug that exists on disk is
 never renamed or deleted here; if a later decomposition stops proposing it, it stays and is marked
-so a human can decide. That also keeps `--check` honest: the node set is derived from disk, so a
+so a human can decide. That also keeps `--compare` honest: the node set is derived from disk, so a
 check never disagrees with a write about which documents should exist.
 """
 from __future__ import annotations

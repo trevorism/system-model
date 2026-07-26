@@ -286,7 +286,7 @@ def render_platform(
     if excused_lines:
         index += ["", "### Authored exceptions", "",
                   "These repos do **not** satisfy a requirement and are knowingly excused by "
-                  "`[[exceptions]]` in `platform.toml`, so `--gate` passes. The requirement still "
+                  "`[[exceptions]]` in `platform.toml`, so `--enforce` passes. The requirement still "
                   "applies to every other service; each exemption is one repo, one signal, and "
                   "stands or falls on the reason given:", ""]
         index += [f"- {line}" for line in excused_lines]

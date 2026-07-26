@@ -172,29 +172,28 @@ def render(
 
 INTENT_TEMPLATE = """# Intent — {repo}
 
-Write here in plain prose. Nothing in this file is generated, and a re-derive never touches it.
-
-Use it to ask for changes to the model or to the code:
-
-- a new obligation this repo must meet
-- a change to an existing requirement (name it, e.g. "R3 should also cover service accounts")
-- a requirement to retire, and why
-- a requirement to promote to binding intent
-
-`--intake` turns entries here into proper requirement records — allocating the id, resolving the
-anchors, and filing it under the right document — so there is no block syntax to learn and no way
-to put one in the wrong place.
-
 ## Desired updates
 
 """
 
 
 def ensure_intent(root, repo_name: str) -> bool:
-    """Create the human-owned file if it is missing. Never overwrites an existing one."""
+    """Create the human-owned file, or refresh it while it is still untouched.
+
+    Never overwrites anything a person wrote. "Untouched" means nothing under `## Desired updates`
+    and no `## Applied` history — so boilerplate can be improved later without a hand migration,
+    while a file with a single entry in it is off limits forever.
+    """
+    from systemmodel.core.overlay import section_body
+
     target = root / INTENT_FILE
+    fresh = INTENT_TEMPLATE.format(repo=repo_name)
     if target.exists():
-        return False
+        current = target.read_text(encoding="utf-8")
+        untouched = (not (section_body(current, "Desired updates") or "").strip()
+                     and section_body(current, "Applied") is None)
+        if not untouched or current == fresh:
+            return False
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(INTENT_TEMPLATE.format(repo=repo_name), encoding="utf-8", newline="\n")
+    target.write_text(fresh, encoding="utf-8", newline="\n")
     return True

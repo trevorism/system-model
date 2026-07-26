@@ -1,6 +1,6 @@
 """`auto`: close the derive↔apply loop by driving an agent from the change brief.
 
-`--apply` stops at emitting a change brief (`core/apply.py`) and hands it to a human. `auto`
+`--brief` stops at emitting a change brief (`core/apply.py`) and hands it to a human. `auto`
 takes the next step: it invokes the `claude` CLI on that brief so the agent edits the repo's
 code, then re-derives and rebuilds the brief as the acceptance test. If drift remains it feeds
 the residual gap back to a fresh agent run, up to a cap.
@@ -94,13 +94,13 @@ def run_auto(repo: Path, adapter: Adapter, *, max_iters: int = 3, dangerous: boo
     if not root.exists():
         on_log(f"error: no model at {root}\n"
                f"       run `uv run systemmodel {repo.name}` first, then edit the .md files and "
-               f"re-run --auto.")
+               f"re-run --remediate.")
         return 2
 
     # Preconditions that only matter once we're actually going to mutate code.
     if not dry_run:
         if shutil.which("claude") is None:
-            on_log("error: `claude` CLI not found on PATH — --auto needs it to edit the repo.")
+            on_log("error: `claude` CLI not found on PATH — --remediate needs it to edit the repo.")
             return 2
         dirty = _dirty_files(repo)
         if dirty is None:
@@ -127,7 +127,7 @@ def run_auto(repo: Path, adapter: Adapter, *, max_iters: int = 3, dangerous: boo
 
     out = root / "change-brief.md"
     for i in range(1, max_iters + 1):
-        on_log(f"\n=== --auto iteration {i}/{max_iters} for {repo.name} ===")
+        on_log(f"\n=== --remediate iteration {i}/{max_iters} for {repo.name} ===")
         out.write_text(brief, encoding="utf-8", newline="\n")
         prompt = brief + _AGENT_FOOTER.format(repo=repo.name)
         try:
@@ -157,5 +157,5 @@ def run_auto(repo: Path, adapter: Adapter, *, max_iters: int = 3, dangerous: boo
 
     out.write_text(brief, encoding="utf-8", newline="\n")
     on_log(f"\nstill drifting after {max_iters} iteration(s); remaining gap left at {out}. "
-           f"Inspect it, then re-run --auto or edit by hand.")
+           f"Inspect it, then re-run --remediate or edit by hand.")
     return 1

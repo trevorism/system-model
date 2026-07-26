@@ -248,11 +248,10 @@ def _md_overview(repo: Path, artifact: dict, wiring: dict, types: list[JavaType]
               "pulling it in transitively through another library is a real consumer too and is "
               "not counted here — treat the number as a floor, not the blast radius.", ""]
 
-    lines += ["## Watch out", ""]
     notes = _risk_notes(wiring, types, consumers)
-    lines += [f"- {note}" for note in notes] if notes else [
-        "_Nothing flagged: the library reaches no platform service on a caller's behalf._"]
-    lines.append("")
+    if notes:
+        lines += ["## Watch out", ""] + [f"- {note}" for note in notes] + [""]
+    lines += ["## Features", ""]
     return "\n".join(lines)
 
 
