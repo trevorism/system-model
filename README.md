@@ -166,7 +166,12 @@ what a requirement's anchors resolve to is what makes a semantic obligation drif
 - Extraction is regex/line based, so unconventional layouts may be partially captured.
 - Repos matching no adapter (CI definitions, npm packages, this tool) aren't modelled at all.
 - Feature decomposition is not stable across runs; slugs are sticky, so the first cut for a repo
-  is the one you keep. Nothing prunes a superseded cut.
+  is the one you keep. A superseded slug is pruned automatically — its prose is never
+  re-synthesized again, so keeping it would leave the model asserting whatever was true when that
+  slug was last proposed. The exception is a superseded file holding authored requirements:
+  deleting it would discard binding intent the fresh cut never restated, so it is kept and flagged
+  for you to migrate through `intent.md`. Expect a re-cut to strand promotions this way — it is the
+  one case this layer cannot resolve on its own.
 - Some anchors — config keys, test fixtures, genuinely prose references — resolve to nothing, and
   a requirement that anchors nothing can never go stale.
 - A library's consumer count includes only repos naming it directly; transitive consumers are real

@@ -37,7 +37,12 @@ _HEADING = re.compile(
     r"^##[ \t]+(?P<slug>[a-z0-9][a-z0-9-]*?)[ \t]+(?:[—–]|-{1,2})[ \t]+(?P<title>.+?)[ \t]*$"
     r"|^##[ \t]+(?P<bare>[a-z0-9][a-z0-9-]*)[ \t]*$",
     re.MULTILINE)
-_UNPROPOSED = "> _No longer proposed by the latest decomposition — keep it or delete the file._"
+_UNPROPOSED = ("> _Superseded by the latest decomposition, and kept only because it holds authored "
+               "requirements the current cut does not carry. Migrate them through `intent.md`, "
+               "then delete this file._")
+# Written when a dropped slug was kept whatever it held, and deleting was the reader's call.
+_LEGACY_UNPROPOSED = "> _No longer proposed by the latest decomposition — keep it or delete the file._"
+_UNPROPOSED_MARKERS = (_UNPROPOSED, _LEGACY_UNPROPOSED)
 _SLUG_SAFE = re.compile(r"[^a-z0-9-]+")
 
 
@@ -90,7 +95,7 @@ def parse_body(text: str) -> Feature | None:
     title, purpose = "", ""
     for line in (summary or "").splitlines():
         stripped = line.strip()
-        if not stripped or stripped == _UNPROPOSED:
+        if not stripped or stripped in _UNPROPOSED_MARKERS:
             continue
         if not title and stripped.startswith("**"):
             title = stripped.strip("*").strip()
@@ -99,7 +104,7 @@ def parse_body(text: str) -> Feature | None:
     return Feature(
         slug="", title=title, purpose=purpose,
         requirements=parse(requirements_text or ""),
-        proposed=_UNPROPOSED not in (summary or ""),
+        proposed=not any(marker in (summary or "") for marker in _UNPROPOSED_MARKERS),
     )
 
 
@@ -188,15 +193,21 @@ def reconcile(prior: dict[str, Feature], fresh: list[Feature],
             requirements=apply_hashes(requirements, index), proposed=True,
         )
 
-    # A slug the decomposition dropped is kept and flagged rather than deleted: the agent may
-    # simply have cut the repo differently this time, and silently discarding a human's promoted
-    # requirements because of that would be the worst failure this layer could have.
+    # A slug the decomposition dropped carries only description the new cut has already restated
+    # in its own words, and that description is never re-synthesized again — so keeping it means
+    # the model goes on asserting whatever was true when the slug was last proposed. Dropping it
+    # lets render prune the file.
+    #
+    # Unless it holds authored intent. Silently discarding a human's promoted requirements because
+    # the agent cut the repo differently would be the worst failure this layer could have, so those
+    # are kept and flagged instead, and the reader is told what the file is holding.
     for slug, feature in prior.items():
-        if slug not in proposed:
-            combined[slug] = Feature(
-                slug=slug, title=feature.title, purpose=feature.purpose,
-                requirements=apply_hashes(feature.requirements, index), proposed=False,
-            )
+        if slug in proposed or not any(r.is_authored for r in feature.requirements):
+            continue
+        combined[slug] = Feature(
+            slug=slug, title=feature.title, purpose=feature.purpose,
+            requirements=apply_hashes(feature.requirements, index), proposed=False,
+        )
     return [combined[slug] for slug in sorted(combined)]
 
 

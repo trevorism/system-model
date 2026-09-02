@@ -21,7 +21,7 @@ from pathlib import Path
 
 from systemmodel.core.evidence import Evidence
 from systemmodel.core.locate import model_root
-from systemmodel.core.render import recorded_decomposition
+from systemmodel.core.render import recorded_decomposition, recorded_state
 from systemmodel.core.overlay import contains_heading_at_or_above, section_body
 from systemmodel.core.requirements import (
     REQUIREMENTS_HEADING, hashes as requirement_hashes, hydrate, parse,
@@ -303,7 +303,11 @@ def decompose(repo: Path, evidence: Evidence, index: dict[str, dict], *,
     from systemmodel.core.features import (
         keep_existing, load, parse_decomposition, reconcile)
 
-    prior = load(model_root(repo))
+    # Hydrate the recorded anchor hashes. Without them every prior requirement looks never-hashed,
+    # apply_hashes cannot tell that anchored code moved, and a re-derive silently re-baselines the
+    # hash while leaving the record claiming `verified` — the exact demotion it exists to perform.
+    root = model_root(repo)
+    prior = load(root, recorded_state(root))
     stamp = evidence.section_hash("requirements")
 
     def keep(reason: str | None = None) -> tuple[list, str, bool]:
@@ -311,7 +315,7 @@ def decompose(repo: Path, evidence: Evidence, index: dict[str, dict], *,
             on_log(reason)
         return keep_existing(prior, index), stamp, False
 
-    if prior and recorded_decomposition(model_root(repo)) == stamp:
+    if prior and recorded_decomposition(root) == stamp:
         return keep()
     if not available():
         return keep("warning: `claude` CLI not found — feature decomposition not refreshed.")

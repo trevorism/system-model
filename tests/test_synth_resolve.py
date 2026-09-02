@@ -3,11 +3,14 @@
 This is the cost control for the whole tool. Re-deriving 54 repos has to be free when nothing
 changed, or nobody runs it — and then the model is stale exactly when it matters.
 """
+import json
 from pathlib import Path
 
 import systemmodel.core.synth as synth
 from systemmodel.core.evidence import Evidence
-from systemmodel.core.requirements import AUTHORED, VERIFIED, Requirement, parse, render
+from systemmodel.core.requirements import (
+    AUTHORED, UNVERIFIED, VERIFIED, Requirement, parse, render,
+)
 from systemmodel.core.schema import Level, Node
 
 SETTLED = "aaaa111122223333"
@@ -49,6 +52,42 @@ def _resolve(repo, nodes, recorded):
 
 def _must_not_fire(*args, **kwargs):
     raise AssertionError("synthesis fired when the evidence had not moved")
+
+
+def test_a_verdict_cannot_outlive_the_code_it_judged(monkeypatch, tmp_path):
+    """A re-derive must demote a verified feature record whose anchored code has moved.
+
+    The decomposition path only sees that movement if it hydrates the recorded anchor hashes.
+    Without them every prior record looks never-hashed, the hash is silently re-baselined, and
+    the record goes on claiming `verified` about code that has since changed.
+    """
+    model_dir = tmp_path / "systemmodel"
+    repo = tmp_path / "dev" / "svc"
+    (model_dir / "svc" / "features").mkdir(parents=True)
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("SYSTEMMODEL_DIR", str(model_dir))
+
+    held = Requirement(id="R2", body="Binding.", anchors=["X"], origin=AUTHORED,
+                       state=VERIFIED, finding="Checked the code as it stood then.")
+    (model_dir / "svc" / "features" / "f.md").write_text(
+        "\n".join(["# Feature: f", "", "## Summary", "", "**Title**", "", "Purpose.", "",
+                   "## Requirements", "", render([held]), ""]), encoding="utf-8")
+
+    evidence = Evidence(target="svc", sections={}, shared={})
+    (model_dir / "svc" / "MANIFEST.json").write_text(json.dumps({
+        "decomposition": evidence.section_hash("requirements"),
+        "nodes": [{"path": "features/f.md",
+                   "requirements": {"R2": "the-hash-recorded-when-it-was-verified"}}],
+    }), encoding="utf-8")
+
+    resolved, _stamp, regenerated = synth.decompose(
+        repo, evidence, {"X": {"body": "the code has since changed"}}, on_log=lambda *a: None)
+
+    assert regenerated is False  # the free path: no re-cut, no agent call
+    demoted = resolved[0].requirements[0]
+    assert demoted.is_authored  # the intent survives
+    assert demoted.state == UNVERIFIED  # the verdict does not
+    assert demoted.finding is None
 
 
 def test_unchanged_evidence_makes_no_agent_call(monkeypatch, tmp_path):

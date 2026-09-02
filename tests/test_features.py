@@ -68,17 +68,45 @@ def test_a_feature_document_round_trips():
     assert recovered.proposed is True
 
 
-def test_a_dropped_slug_is_kept_and_flagged_rather_than_deleted():
+def test_a_dropped_slug_holding_only_description_is_pruned():
+    """Its prose is never re-synthesized again, so keeping it means asserting a stale claim."""
     prior = {f.slug: f for f in parse_decomposition(DECOMPOSITION)}
     fresh = parse_decomposition("## timeline-scaling -- Proportional Layout\nStill here.\n"
                                 "R1. Must normalise.\n    -> MAX_PIXEL_LENGTH\n")
 
     result = {f.slug: f for f in reconcile(prior, fresh, INDEX)}
 
-    assert set(result) == set(prior)  # nothing disappeared
+    assert set(result) == {"timeline-scaling"}
     assert result["timeline-scaling"].proposed is True
-    assert result["employment-gap-marking"].proposed is False
-    assert "No longer proposed" in result["employment-gap-marking"].summary()
+
+
+def test_a_dropped_slug_holding_authored_intent_is_kept_and_flagged():
+    """Pruning binding intent the fresh cut never restated would be silent, unrecoverable loss."""
+    prior = {"employment-gap-marking": Feature(
+        "employment-gap-marking", "Career Gap Detection", "Makes gaps visible.",
+        [Requirement(id="R1", body="Disposable description."),
+         Requirement(id="R2", body="Binding intent.", origin=AUTHORED, state=VERIFIED)])}
+    fresh = parse_decomposition("## timeline-scaling -- Proportional Layout\nStill here.\n"
+                                "R1. Must normalise.\n    -> MAX_PIXEL_LENGTH\n")
+
+    result = {f.slug: f for f in reconcile(prior, fresh, INDEX)}
+
+    assert set(result) == {"timeline-scaling", "employment-gap-marking"}
+    kept = result["employment-gap-marking"]
+    assert kept.proposed is False
+    assert "Superseded" in kept.summary()
+    assert [r.body for r in kept.requirements if r.is_authored] == ["Binding intent."]
+
+
+def test_the_legacy_supersession_marker_still_parses():
+    """Model dirs written before the marker changed must not fold it into the purpose prose."""
+    legacy = ("**Career Gap Detection**\n\n"
+              "> _No longer proposed by the latest decomposition — keep it or delete the file._\n\n"
+              "Makes gaps visible.")
+    recovered = parse_body(f"# Feature: x\n\n## Summary\n\n{legacy}\n\n## Requirements\n\n")
+
+    assert recovered.proposed is False
+    assert recovered.purpose == "Makes gaps visible."
 
 
 def test_a_promoted_requirement_survives_a_fresh_decomposition():
