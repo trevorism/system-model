@@ -59,13 +59,19 @@ def test_records_round_trip_through_render_and_parse():
     assert reparsed == original
 
 
-def test_a_record_at_its_defaults_carries_no_annotation():
-    """Almost every record is derived and unverified; only deviation is worth showing."""
+def test_every_record_names_its_origin():
+    """A reader must never mistake what the code was found doing for what it was told to do."""
     plain = render([Requirement(id="R1", body="Just a description.", anchors=["X"])])
-    assert plain.splitlines()[0] == "### R1"
+    assert plain.splitlines()[0] == "### R1 — observed"
 
     promoted = render([Requirement(id="R1", body="Binding.", origin=AUTHORED, state=VERIFIED)])
     assert promoted.splitlines()[0] == "### R1 — authored, verified"
+
+
+def test_the_observed_label_round_trips_as_derived():
+    """The label is prose for the reader; origin still defaults to derived on the way back in."""
+    observed = Requirement(id="R1", body="Just a description.", anchors=["X"])
+    assert parse(render([observed])) == [observed]
 
 
 def test_render_orders_numerically_not_lexically():

@@ -447,10 +447,13 @@ def _apply_repo(repo: Path, args) -> int:
         return 2
 
     brief = build_brief(repo, advisories=_advisories(repo, args))
-    if brief is None:
-        print(f"{repo.name}: every authored requirement is verified — nothing to apply.")
-        return 0
     out = root / "change-brief.md"
+    if brief is None:
+        stale = out.exists()
+        out.unlink(missing_ok=True)
+        print(f"{repo.name}: every authored requirement is verified — "
+              + (f"removed the stale brief at {out}." if stale else "nothing to apply."))
+        return 0
     out.write_text(brief, encoding="utf-8", newline="\n")
     print(brief)
     print(f"\n(wrote {out})")

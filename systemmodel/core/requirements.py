@@ -7,15 +7,22 @@ costs attention without repaying it.
 
 A record is plain Markdown, with nothing in it a reader has to be told to ignore:
 
+    ### R1 — observed
+    Listing is unauthenticated and therefore always reports the default bucket.
+    → `ObjectController.listTables`, `DEFAULT_BUCKET_NAME`
+
     ### R2 — authored, verified
     Role is derived, never requested: apps get system; users get user, escalating to tenant
     admin or full admin only when the stored admin flag is set.
     → `AccessTokenService.getRoleForIdentity`, `User.admin`
     > Verified — derives every role claim server-side; no request model carries a role.
 
-**Defaults are invisible.** A bare `### R1` means derived and unverified, which is almost every
-record; only a deviation is annotated. Machine state with no meaning to a reader — the anchor
-hash — lives in `MANIFEST.json` instead of cluttering the prose.
+**Every record names its origin.** `observed` is what the code was found doing; `authored` is what
+it has been told to do. Almost every record is observed, so the label is redundant to a reader who
+already knows the default — and load-bearing for one who does not, which now includes agents
+reading the model to plan a change. An unlabelled record read as binding intent turns incidental
+behaviour into a constraint nobody chose. Machine state with no meaning to a reader — the anchor
+hash — still lives in `MANIFEST.json` instead of cluttering the prose.
 
 **Origin decides lifetime.** `derived` records are description, regenerated whenever synthesis
 re-runs. `authored` records are binding intent and survive regeneration untouched. An authored id
@@ -34,6 +41,7 @@ REQUIREMENTS_HEADING = "Requirements"
 
 AUTHORED = "authored"
 DERIVED = "derived"
+OBSERVED = "observed"
 
 UNVERIFIED = "unverified"
 VERIFIED = "verified"
@@ -114,17 +122,14 @@ class Requirement:
         return found
 
     def status_words(self) -> list[str]:
-        """The annotations worth showing. Empty when the record is at its defaults."""
-        words = []
-        if self.origin != DERIVED:
-            words.append(self.origin)
+        """The annotations worth showing, origin first."""
+        words = [OBSERVED if self.origin == DERIVED else self.origin]
         if self.state != UNVERIFIED:
             words.append(self.state)
         return words
 
     def render(self) -> str:
-        status = ", ".join(self.status_words())
-        lines = [f"### {self.id}" + (f" — {status}" if status else ""), self.body]
+        lines = [f"### {self.id} — {', '.join(self.status_words())}", self.body]
         if self.anchors:
             lines.append("→ " + ", ".join(f"`{a}`" for a in self.anchors))
         if self.finding and self.state in (VERIFIED, VIOLATED):

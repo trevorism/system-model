@@ -37,7 +37,7 @@ ignore. Machine state — content, evidence and anchor hashes — lives in `MANI
 A requirement is one obligation, in one place, anchored to the code it rests on.
 
 ```markdown
-### R1
+### R1 — observed
 Access tokens live fifteen minutes and carry role, database id and entity type.
 → `AccessTokenService.createClaimsMap`, `Identity.getPermissions`
 
@@ -48,9 +48,11 @@ when the stored admin flag is set.
 > Verified — derives every role claim server-side; no request model carries a role.
 ```
 
-A bare `### R1` means **derived** and **unverified** — description, regenerated whenever synthesis
-re-runs. `authored` means binding intent: it survives regeneration untouched and keeps its id
-forever, so a verdict can cite it across runs.
+`observed` means **derived** and **unverified** — what the code was found doing, regenerated
+whenever synthesis re-runs. `authored` means binding intent: it survives regeneration untouched
+and keeps its id forever, so a verdict can cite it across runs. **Read the label before treating a
+requirement as a constraint** — an observed record documents current behaviour, and nothing has
+decided that behaviour is worth keeping.
 
 Each requirement's **anchor hash** covers the extracted facts its `→` symbols resolve to. When
 those move the requirement is *stale*: a verified record is demoted and its verdict cleared,
@@ -74,8 +76,10 @@ uv run systemmodel <repo>              # derive the model from the code (the def
 Scope and modifiers: `--all` (every detected repo), `--platform` (the L0 model), `--dry-run`,
 `--adapter NAME`, and for `--remediate`: `--max-iters`, `--dangerous`, `--model`.
 
-`derive`, `--compare` and `--enforce` are free and offline. `--adopt`, `--verify` and
-`--remediate` call the `claude` CLI and need it on `PATH`.
+`--compare` and `--enforce` are free and offline; so is `--dry-run`, which reconciles the skeleton
+without synthesizing. A writing `derive` calls the `claude` CLI for any section whose evidence
+moved — free when nothing changed, but not free in general. `--adopt`, `--verify` and
+`--remediate` always call it. All of them need it on `PATH`.
 
 Prerequisite: [uv](https://docs.astral.sh/uv/) — no install or venv activation needed.
 Equivalent without it: `python -m systemmodel.derive <repo> ...`.
